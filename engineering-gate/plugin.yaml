@@ -1,0 +1,17 @@
+name: engineering-gate
+version: "3.1.0"
+description: >
+  Pre-tool-call enforcement of the agentic-build-audit-loop.
+  Blocks write_file/patch/terminal-build commands unless the
+  adversarial judge step has run via the judge profile (pro).
+  Inspection tools (read, search, browser) and docs/infra paths
+  are always allowed.
+
+  v3.1 adds stuck agent detection, concurrent file-write prevention
+  (per-session locks), and evidence classification with pre-mutation
+  evidence checks.
+hooks:
+  - on_session_start
+  - on_session_end
+  - pre_tool_call
+  - post_tool_call
