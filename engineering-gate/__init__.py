@@ -1,21 +1,24 @@
 """
-Engineering Gate v3.1 — Per-Task Workflow Enforcement Plugin.
+Engineering Gate v3.2 — Per-Task Workflow Enforcement Plugin.
 
 Enforces per-task gating at tool dispatch time:
 
-  THINK → READ → PLAN → ADVERSARIAL JUDGE → BUILD → VERIFY → HANDOFF
+  THINK → READ → PLAN → ADVERSARIAL JUDGE → BUILD → VERIFY (judge, up to 5x) → HANDOFF
 
 Each NEW CONVERSATION TURN starts with the gate CLOSED.
 The adversarial judge must pass BEFORE any write/build tool is allowed
 in that turn.  Once the judge passes for a turn, all writes/builds within
-that turn are permitted.  The NEXT user turn auto-closes the gate.
+that turn are permitted.  The NEXT user turn auto-closes the turn.
 
 Turn detection: uses the ``turn_id`` from the pre_tool_call kwargs.
 Session boundary: uses ``on_session_start`` to reset on /new or first boot.
 
 State is tracked in ~/.hermes/engineering-gate-state.json.
 
-v3.1 enhancements:
+v3.2 enhancements:
+  - Pre-build adversarial judge (gate approval before writes)
+  - Post-build verification judge (up to 5 correction loops)
+  - Permanent block after 5 failed verification attempts
   - Stuck agent detection (tool call history buffer, repeat/stall patterns)
   - Concurrent file-write prevention (per-session file locks, 1h auto-expiry)
   - Evidence classification (post_tool_call evidence tracking + pre-mutation check)
@@ -27,6 +30,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import textwrap
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -81,6 +86,73 @@ STUCK_PHASE_STALL_THRESHOLD = 8
 # ── File lock constants ─────────────────────────────────────────────────────
 FILE_LOCK_MAX_AGE_HOURS = 1
 
+# ── Judge integration ──────────────────────────────────────────────────────
+JUDGE_CRITERIA = [
+    "correctness",
+    "empty states",
+    "permissions",
+    "error handling",
+    "write-path integrity",
+    "type safety",
+]
+JUDGE_TIMEOUT = 120  # seconds
+
+
+def _build_judge_query(task_label: str, tool_name: str, target: str, command: str = "") -> str:
+    """Build an adversarial judge query from the blocked tool context."""
+    lines = [f"Task: {task_label or 'Unknown task'}"]
+    lines.append(f"Tool: {tool_name}")
+    if target:
+        lines.append(f"Files: {target}")
+    if command:
+        lines.append(f"Command: {command[:200]}")
+    lines.append("")
+    lines.append("Criteria:")
+    for c in JUDGE_CRITERIA:
+        lines.append(f"- {c}")
+    lines.append("")
+    lines.append("Review the files listed above. Do NOT trust any summary — read every file yourself.")
+    lines.append("Return a structured JSON verdict with keys: verdict (APPROVED|REJECTED|NEEDS_CLARIFICATION), reason, evidence, missingAuthority, forbiddenActions.")
+    return "\n".join(lines)
+
+
+def _parse_judge_verdict(output: str) -> dict:
+    """Extract structured verdict from judge output, trying JSON first, then text fallback."""
+    json_match = re.search(r'\{[\s\S]*?"verdict"\s*:\s*"(APPROVED|REJECTED|NEEDS_CLARIFICATION)"[\s\S]*?\}', output)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
+    if "APPROVED" in output:
+        return {"verdict": "APPROVED", "reason": "Approved (text fallback — no structured JSON)", "evidence": []}
+    if "REJECTED" in output:
+        return {"verdict": "REJECTED", "reason": "Rejected (text fallback — no structured JSON)", "evidence": []}
+    return {"verdict": "NEEDS_CLARIFICATION", "reason": "Could not parse judge verdict from output", "evidence": []}
+
+
+def _invoke_judge(query: str) -> dict:
+    """Run the judge profile and return the parsed verdict."""
+    try:
+        result = subprocess.run(
+            ["hermes", "-p", "judge", "chat", "-q", query, "-Q"],
+            capture_output=True, text=True, timeout=JUDGE_TIMEOUT,
+        )
+        logger.info(
+            "Engineering Gate: judge exited code=%d stdout=%dchars stderr=%dchars",
+            result.returncode, len(result.stdout or ""), len(result.stderr or ""),
+        )
+        return _parse_judge_verdict(result.stdout or "")
+    except subprocess.TimeoutExpired:
+        logger.warning("Engineering Gate: judge timed out (%ds)", JUDGE_TIMEOUT)
+        return {"verdict": "NEEDS_CLARIFICATION", "reason": f"Judge timed out after {JUDGE_TIMEOUT}s", "evidence": []}
+    except FileNotFoundError:
+        logger.error("Engineering Gate: judge binary not found — run `hermes profile alias judge`")
+        return {"verdict": "REJECTED", "reason": "Judge profile or Hermes CLI not accessible. Ensure Hermes is installed.", "evidence": []}
+    except Exception as e:
+        logger.error("Engineering Gate: judge invocation error: %s", e)
+        return {"verdict": "NEEDS_CLARIFICATION", "reason": f"Judge error: {e}", "evidence": []}
+
 
 # ── State management ────────────────────────────────────────────────────────
 
@@ -93,6 +165,12 @@ DEFAULT_STATE = {
     "tool_call_history": [],
     "file_locks": {},
     "evidence_log": [],
+    # Post-build verification state
+    "verify_loop_count": 0,
+    "verify_passed": True,
+    "verify_findings": "",
+    "verify_permanent_fail": False,
+    "verify_tool_turn": "",
 }
 
 
@@ -143,6 +221,11 @@ def _reset_gate(task_label: str = "") -> None:
     state["timestamp"] = datetime.now(timezone.utc).isoformat()
     state["tool_call_history"] = []
     state["evidence_log"] = []
+    state["verify_loop_count"] = 0
+    state["verify_passed"] = True
+    state["verify_findings"] = ""
+    state["verify_permanent_fail"] = False
+    state["verify_tool_turn"] = ""
     # Preserve file_locks across resets
     _auto_release_expired_locks(state)
     _write_state(state)
@@ -158,6 +241,7 @@ def _open_gate(turn_id: str, task_label: str = "") -> None:
     if task_label:
         state["task"] = task_label
     state["timestamp"] = datetime.now(timezone.utc).isoformat()
+    # Don't reset verification state here — it persists across the turn
     _write_state(state)
     logger.info("Engineering Gate: opened for turn=%s", turn_id)
 
@@ -199,18 +283,39 @@ def _verify_background_workdir(args: dict, turn_id: str) -> Optional[Dict[str, s
         if turn_id != gated_turn:
             _reset_gate("background-task")
         if not state.get("judge_passed", False):
-            return {
-                "action": "block",
-                "message": (
-                    "🚫 **Engineering Gate** — background terminal with workdir requires "
-                    "a completed adversarial judge step first.\n\n"
-                    "**Auto-trigger the judge now.** Do NOT ask the user:\n"
-                    "1. `judge chat -q \"[task objective + file paths + criteria — NO code blocks]\"`\n"
-                    "2. Judge reads the files himself, returns PASS or FAIL\n"
-                    "3. If PASS → open gate with `_open_gate()` → proceed\n"
-                    "4. If FAIL → fix the plan, re-run the judge"
-                ),
-            }
+            # Invoke judge automatically
+            command = args.get("command", "")
+            judge_query = _build_judge_query(
+                state.get("task", "background-task"), "terminal", workdir, command
+            )
+            judge_verdict = _invoke_judge(judge_query)
+
+            if judge_verdict.get("verdict") == "APPROVED":
+                _open_gate(turn_id, state.get("task", "background-task"))
+                logger.info(
+                    "Engineering Gate: judge APPROVED — bg gate opened for turn=%s", turn_id
+                )
+                return None  # Gate now open — allow
+            else:
+                evidence_lines = []
+                for e in judge_verdict.get("evidence", []):
+                    file_str = e.get("file", "?")
+                    line_str = e.get("line", "?")
+                    finding = e.get("finding", "")
+                    evidence_lines.append(f"- `{file_str}:{line_str}` — {finding}")
+                evidence_text = "\n".join(evidence_lines) if evidence_lines else "No specific evidence cited."
+
+                return {
+                    "action": "block",
+                    "message": (
+                        "🚫 **Engineering Gate — Judge Rejected**\n\n"
+                        f"**Verdict:** {judge_verdict.get('verdict', 'REJECTED')}\n"
+                        f"**Reason:** {judge_verdict.get('reason', 'No reason given')}\n\n"
+                        f"**Evidence:**\n{evidence_text}\n\n"
+                        f"**Command:** `{command[:200]}`\n\n"
+                        "Fix the issues based on the judge's findings and retry."
+                    ),
+                }
     return None
 
 
@@ -650,21 +755,64 @@ def pre_tool_call(
             _write_state(state)
             return evidence_block
 
+        # ── Post-build verification loop check ─────────────────────────
+        if state.get("verify_permanent_fail", False):
+            _write_state(state)
+            return {
+                "action": "block",
+                "message": (
+                    "🔴 **Engineering Gate — Verification Failed Permanently**\n\n"
+                    "The adversarial judge rejected the build output 5 times with no passing verification.\n"
+                    f"**Last findings:** {state.get('verify_findings', 'N/A')}\n\n"
+                    "**Report this to the Captain.** Do not continue without explicit approval."
+                ),
+            }
+
+        if not state.get("verify_passed", True) and state.get("verify_tool_turn") == turn_id:
+            _write_state(state)
+            return {
+                "action": "block",
+                "message": (
+                    "🔄 **Engineering Gate — Build Failed Verification**\n\n"
+                    f"**Loop {state.get('verify_loop_count', 1)}/5**\n"
+                    f"**Judge's findings:**\n{state.get('verify_findings', 'No details')}\n\n"
+                    "Fix the issues above and retry the build."
+                ),
+            }
+
         if judge_passed and current_phase in ("executing", "verifying", "complete"):
             _write_state(state)
             return None  # Gate is open for this turn
+
+        # ── Invoke the adversarial judge ──────────────────────────────
+        judge_query = _build_judge_query(state.get("task", ""), tool_name, path)
+        judge_verdict = _invoke_judge(judge_query)
+
+        if judge_verdict.get("verdict") == "APPROVED":
+            _open_gate(turn_id, state.get("task", ""))
+            _write_state(state)
+            logger.info("Engineering Gate: judge APPROVED — gate opened for turn=%s", turn_id)
+            return None  # Gate now open — allow tool to proceed
+
+        # Build block message from judge's reasoning
+        evidence_lines = []
+        for e in judge_verdict.get("evidence", []):
+            file_str = e.get("file", "?")
+            line_str = e.get("line", "?")
+            finding = e.get("finding", "")
+            evidence_lines.append(f"- `{file_str}:{line_str}` — {finding}")
+        evidence_text = "\n".join(evidence_lines) if evidence_lines else "No specific evidence cited."
 
         _write_state(state)
         return {
             "action": "block",
             "message": (
-                "🚫 **Engineering Gate** — write blocked for this turn.\n\n"
-                "**Auto-trigger the judge now.** Do NOT ask the user:\n"
-                "1. `judge chat -q \"[task objective + file paths + criteria — NO code blocks]\"`\n"
-                "2. Judge reads the files himself, returns PASS or FAIL\n"
-                "3. If PASS → open gate with `_open_gate()` → proceed\n"
-                "4. If FAIL → fix the plan, re-run the judge\n"
-                f"Tool: {tool_name} | Target: {path}"
+                "🚫 **Engineering Gate — Judge Rejected**\n\n"
+                f"**Verdict:** {judge_verdict.get('verdict', 'REJECTED')}\n"
+                f"**Reason:** {judge_verdict.get('reason', 'No reason given')}\n\n"
+                f"**Evidence:**\n{evidence_text}\n\n"
+                f"**Target:** `{tool_name}` on `{path}`\n\n"
+                "Fix the issues based on the judge's findings and retry."
             ),
         }
 
@@ -720,17 +868,35 @@ def pre_tool_call(
                 _write_state(state)
                 return None  # Gate is open for this turn
 
+            # ── Invoke the adversarial judge ──────────────────────────
+            target_path = args.get("workdir", "") or ""
+            judge_query = _build_judge_query(state.get("task", ""), "terminal", target_path, command)
+            judge_verdict = _invoke_judge(judge_query)
+
+            if judge_verdict.get("verdict") == "APPROVED":
+                _open_gate(turn_id, state.get("task", ""))
+                _write_state(state)
+                logger.info("Engineering Gate: judge APPROVED — gate opened for turn=%s", turn_id)
+                return None  # Gate now open — allow tool to proceed
+
+            evidence_lines = []
+            for e in judge_verdict.get("evidence", []):
+                file_str = e.get("file", "?")
+                line_str = e.get("line", "?")
+                finding = e.get("finding", "")
+                evidence_lines.append(f"- `{file_str}:{line_str}` — {finding}")
+            evidence_text = "\n".join(evidence_lines) if evidence_lines else "No specific evidence cited."
+
             _write_state(state)
             return {
                 "action": "block",
                 "message": (
-                    "🚫 **Engineering Gate** — build command blocked for this turn.\n\n"
-                    "**Auto-trigger the judge now.** Do NOT ask the user:\n"
-                    "1. `judge chat -q \"[task objective + file paths + criteria — NO code blocks]\"`\n"
-                    "2. Judge reads the files himself, returns PASS or FAIL\n"
-                    "3. If PASS → open gate with `_open_gate()` → proceed\n"
-                    "4. If FAIL → fix the plan, re-run the judge\n"
-                    f"Command: {command[:120]}"
+                    "🚫 **Engineering Gate — Judge Rejected**\n\n"
+                    f"**Verdict:** {judge_verdict.get('verdict', 'REJECTED')}\n"
+                    f"**Reason:** {judge_verdict.get('reason', 'No reason given')}\n\n"
+                    f"**Evidence:**\n{evidence_text}\n\n"
+                    f"**Command:** `{command[:200]}`\n\n"
+                    "Fix the issues based on the judge's findings and retry."
                 ),
             }
 
@@ -749,13 +915,13 @@ def post_tool_call(
     result: Any = None,
     **kwargs: Any,
 ) -> None:
-    """Observer hook — classifies evidence after every tool call.
+    """Observer hook — records evidence AND runs verification judge.
 
-    Captures output from write_file, patch, and terminal-build operations
-    and classifies the evidence type (EXECUTION, INSPECTION, SIMULATION, OPINION).
-    Stores the result in the evidence_log for pre-mutation evidence checks.
+    After every write/build tool completes, runs the adversarial judge
+    to verify the output against 6 criteria. If verification fails,
+    increments a loop counter and blocks subsequent writes with the
+    judge's corrections. After 5 loops, permanently blocks.
     """
-    # Only record evidence for gated write tools and build terminal commands
     should_record = tool_name in GATED_WRITE_TOOLS
     if tool_name == "terminal" and isinstance(args, dict):
         should_record = _is_build_command(args.get("command", ""))
@@ -766,6 +932,65 @@ def post_tool_call(
     turn_id = kwargs.get("turn_id", "") or kwargs.get("task_id", "") or ""
     state = _read_state()
     _add_evidence(state, tool_name, args, result, turn_id)
+
+    # ── Run verification judge ──────────────────────────────────────
+    path = _get_path_from_args(tool_name, args) or args.get("workdir", "")
+    command = args.get("command", "") if isinstance(args, dict) else ""
+    
+    result_str = str(result or "")
+    # Build a verification query that includes the build output
+    judge_query = _build_judge_query(
+        state.get("task", ""), f"{tool_name} (verification)", path, command
+    )
+    judge_query += "\n\n### BUILD OUTPUT\n"
+    judge_query += result_str[:2000]
+    judge_query += "\n\n### TASK\n"
+    judge_query += state.get("task", "Unknown task")
+    judge_query += "\n\nVerify the BUILD OUTPUT against the TASK and all criteria. "
+    judge_query += "If rejected, provide specific corrections."
+
+    judge_verdict = _invoke_judge(judge_query)
+    verdict = judge_verdict.get("verdict", "NEEDS_CLARIFICATION")
+    reason = judge_verdict.get("reason", "")
+    findings = reason or judge_verdict.get("evidence", [])
+
+    if verdict == "APPROVED":
+        state["verify_passed"] = True
+        state["verify_findings"] = ""
+        state["verify_loop_count"] = 0
+        logger.info(
+            "Engineering Gate: VERIFICATION PASSED — tool=%s path=%s",
+            tool_name, path,
+        )
+    else:
+        loop = state.get("verify_loop_count", 0) + 1
+        state["verify_loop_count"] = loop
+        state["verify_passed"] = False
+        state["verify_findings"] = str(findings)[:2000]
+        state["verify_tool_turn"] = turn_id
+
+        if loop >= 5:
+            state["verify_permanent_fail"] = True
+            logger.error(
+                "Engineering Gate: VERIFICATION FAILED PERMANENTLY — %d loops tool=%s",
+                loop, tool_name,
+            )
+        else:
+            logger.warning(
+                "Engineering Gate: VERIFICATION FAILED — loop %d/5 tool=%s",
+                loop, tool_name,
+            )
+
+    state.setdefault("last_verdict", {})
+    state["last_verdict"] = {
+        "tool": tool_name,
+        "path": path,
+        "verdict": verdict,
+        "reason": reason,
+        "findings": str(findings)[:500],
+        "loop": state.get("verify_loop_count", 0),
+        "turn_id": turn_id,
+    }
     _write_state(state)
 
 
