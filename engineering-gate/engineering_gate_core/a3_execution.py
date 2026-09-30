@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -79,25 +80,60 @@ class GateWriteService:
         relative = Path(target)
         if relative.is_absolute() or not relative.parts or any(part in (".", "..") for part in relative.parts):
             raise PermissionError("target must be a contained relative path")
-        destination = self._root.joinpath(relative)
-        resolved = destination.resolve(strict=False)
-        if not resolved.is_relative_to(self._root):
-            raise PermissionError("target escapes write root")
-        if destination.is_symlink():
-            raise PermissionError("symlink targets are not writable")
-        if not resolved.parent.is_dir():
-            raise PermissionError("target parent must already exist")
+        if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "supports_dir_fd")) or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd or os.rename not in os.supports_dir_fd:
+            raise PermissionError("platform lacks safe descriptor-relative filesystem operations")
         if not isinstance(arguments, dict) or set(arguments) != {"content"} or not isinstance(arguments["content"], str):
             raise ValueError("write arguments must contain only string content")
 
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(resolved, flags, 0o666)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptors: list[int] = []
+        temp_name: str | None = None
+        parent_fd = os.open(self._root, directory_flags)
+        descriptors.append(parent_fd)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
-                stream.write(arguments["content"])
-        except BaseException:
-            # fdopen owns the descriptor once constructed.
-            raise
-        return resolved
+            for part in relative.parts[:-1]:
+                try:
+                    parent_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise PermissionError("target parent is missing or traverses a symlink") from exc
+                descriptors.append(parent_fd)
+
+            name = relative.parts[-1]
+            try:
+                existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            except OSError as exc:
+                raise PermissionError("target cannot be inspected safely") from exc
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise PermissionError("target must be a regular file, not a symlink or special file")
+
+            # Replacement gives the new file the normal creation mode (0666 filtered
+            # by umask); for an existing regular file preserve its permission bits,
+            # matching the prior truncate-in-place behavior without following links.
+            temp_name = f".gate-write-{secrets.token_hex(16)}.tmp"
+            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent_fd)
+            try:
+                if existing is not None:
+                    os.fchmod(fd, stat.S_IMODE(existing.st_mode))
+                data = arguments["content"].encode("utf-8")
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short write")
+                    view = view[written:]
+            finally:
+                os.close(fd)
+
+            os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            temp_name = None
+        finally:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+        return self._root.joinpath(relative)

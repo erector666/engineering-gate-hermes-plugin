@@ -80,11 +80,57 @@ class GateOwnedWriteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.permit(operation="unknown")
 
+    def test_write_does_not_follow_hard_link_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as outside_dir:
+            outside = Path(outside_dir) / "outside.txt"
+            outside.write_text("external original")
+            linked = self.root / "approved.txt"
+            linked.hardlink_to(outside)
+            permit = self.permit()
+
+            self.request(permit)
+
+            self.assertEqual(outside.read_text(), "external original")
+            self.assertEqual(linked.read_text(), "approved")
+
+    def test_final_symlink_is_rejected_without_modifying_target(self):
+        with tempfile.TemporaryDirectory() as outside_dir:
+            outside = Path(outside_dir) / "outside.txt"
+            outside.write_text("external original")
+            (self.root / "approved.txt").symlink_to(outside)
+            permit = self.permit()
+
+            with self.assertRaises(PermissionError):
+                self.request(permit)
+
+            self.assertEqual(outside.read_text(), "external original")
+
+    def test_intermediate_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as outside_dir:
+            (self.root / "linked-dir").symlink_to(outside_dir, target_is_directory=True)
+            permit = self.permit(target="linked-dir/file.txt")
+            with self.assertRaises(PermissionError):
+                self.request(permit, target="linked-dir/file.txt")
+            self.assertFalse((Path(outside_dir) / "file.txt").exists())
+
+    def test_failed_atomic_write_preserves_existing_file(self):
+        import unittest.mock
+        target = self.root / "approved.txt"
+        target.write_text("original")
+        permit = self.permit()
+        with unittest.mock.patch("engineering_gate_core.a3_execution.os.write", side_effect=OSError("disk failure")):
+            with self.assertRaises(OSError):
+                self.request(permit)
+        self.assertEqual(target.read_text(), "original")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["approved.txt"])
+
     def test_parent_traversal_is_rejected(self):
+        outside = self.root.parent / "outside.txt"
+        before = outside.read_bytes() if outside.exists() else None
         permit = self.permit(target="../outside.txt")
         with self.assertRaises(PermissionError):
             self.request(permit, target="../outside.txt")
-        self.assertFalse((self.root.parent / "outside.txt").exists())
+        self.assertEqual(outside.read_bytes() if outside.exists() else None, before)
 
     def test_symlink_escape_is_rejected(self):
         with tempfile.TemporaryDirectory() as outside:
