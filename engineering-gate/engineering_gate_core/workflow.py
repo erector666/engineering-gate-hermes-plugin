@@ -15,6 +15,7 @@ Stage = TaskState
 def canonical_plan_digest(plan: Plan) -> PlanDigest:
     payload = {
         "objective": plan.objective,
+        "workspace_root": plan.workspace_root,
         "operations": [{"kind": op.kind.value, "target": op.target, "rationale": op.rationale} for op in plan.operations],
         "acceptance_criteria": [{"criterion_id": c.criterion_id, "description": c.description,
                                  "verification_procedure": c.verification_procedure} for c in plan.acceptance_criteria],
@@ -93,6 +94,12 @@ def transition(task: TaskStateRecord, event: Event, artifact: object | None = No
         raise TransitionError(f"{event.value} requires {artifact_type.__name__} evidence")
     if field_name == "inspection" and not artifact.evidence_id.strip():
         raise TransitionError("inspection reference must have an evidence ID")
+    if field_name == "plan" and (
+        task.inspection is None
+        or not task.inspection.evidence_id.strip()
+        or not task.inspection.description.strip()
+    ):
+        raise TransitionError("plan requires a nonempty inspection evidence reference")
     if field_name == "plan" and not (artifact.operations and artifact.acceptance_criteria and artifact.verification):
         raise TransitionError("plan requires operations, acceptance criteria, and verification")
     if field_name == "plan":

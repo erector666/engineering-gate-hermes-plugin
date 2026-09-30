@@ -46,6 +46,7 @@ class Plan:
     acceptance_criteria: tuple["AcceptanceCriterion", ...]
     verification: tuple[str, ...]
     exclusions: tuple[str, ...] = ()
+    workspace_root: str = ""
 
 
 @dataclass(frozen=True)

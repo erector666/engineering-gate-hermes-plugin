@@ -75,11 +75,29 @@ class WorkflowTests(unittest.TestCase):
 
     def test_first_plan_sets_revision_and_digest(self):
         task = new_task("first", "Feature", RequesterIdentity("u"))
-        task = TaskStateRecord(task.task, TaskState.PLAN, task.revision, task.history + (TaskState.ANALYZE, TaskState.PLAN))
+        task = TaskStateRecord(task.task, TaskState.PLAN, task.revision, task.history + (TaskState.ANALYZE, TaskState.PLAN),
+                               inspection=InspectionEvidenceRef("inspect-1", "baseline snapshot"))
         plan = Plan("Feature", (NormalizedOperation(OperationKind.WRITE, "a"),), (AcceptanceCriterion("c", "works", "test"),), ("test",))
         result = transition(task, Event.PLAN_RECORDED, plan)
         self.assertEqual(result.revision, 1)
         self.assertEqual(result.plan_digest, canonical_plan_digest(plan))
+
+    def test_plan_recording_requires_nonempty_inspection_reference(self):
+        task = new_task("first", "Feature", RequesterIdentity("u"))
+        task = TaskStateRecord(task.task, TaskState.PLAN, task.revision, task.history + (TaskState.ANALYZE, TaskState.PLAN))
+        plan = Plan("Feature", (NormalizedOperation(OperationKind.WRITE, "a"),), (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        with self.assertRaises(TransitionError):
+            transition(task, Event.PLAN_RECORDED, plan)
+
+    def test_malformed_inspection_reference_cannot_authorize_plan(self):
+        plan = Plan("Feature", (NormalizedOperation(OperationKind.WRITE, "a"),), (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        for inspection in (InspectionEvidenceRef(" ", "baseline"), InspectionEvidenceRef("inspect-1", " ")):
+            with self.subTest(inspection=inspection):
+                task = new_task("first", "Feature", RequesterIdentity("u"))
+                task = TaskStateRecord(task.task, TaskState.PLAN, task.revision, task.history + (TaskState.ANALYZE, TaskState.PLAN),
+                                       inspection=inspection)
+                with self.assertRaises(TransitionError):
+                    transition(task, Event.PLAN_RECORDED, plan)
 
     def test_plan_review_wrong_verdicts_are_rejected(self):
         task = new_task("review", "Feature", RequesterIdentity("u"))
