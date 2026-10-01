@@ -14,9 +14,9 @@ import typing
 
 from . import models
 from .models import ApprovalReceipt, MutationAuthorization, MutationProposal, TaskID, TaskStateRecord
-from .workflow import Event, TransitionError, canonical_mutation_proposal_digest, canonical_plan_digest, new_task, record_approval, record_mutation_authorization, record_mutation_proposal, transition
+from .workflow import Event, TransitionError, canonical_mutation_proposal_digest, canonical_plan_digest, new_task, record_approval, _record_gate_observed_verification, record_mutation_authorization, record_mutation_proposal, capture_workspace_identity, transition
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
 _DATACLASSES = {name: value for name, value in vars(models).items()
                 if isinstance(value, type) and is_dataclass(value)}
 _ENUMS = {name: value for name, value in vars(models).items()
@@ -162,18 +162,23 @@ def _decode(value, *, allow_legacy_missing=False):
         actual = set(value) - {"$type"}
         missing = expected - actual
         allowed = (({"mutation_proposal", "mutation_authorization"} if name == "TaskStateRecord" else
-                    {"workspace_identity"} if name == "Plan" else set()) if allow_legacy_missing else set())
+                    {"workspace_identity", "verification_commands"} if name == "Plan" else
+                    {"provenance"} if name == "Evidence" else set()) if allow_legacy_missing else set())
         if actual - expected or missing - allowed:
             raise StateStoreError("record fields do not match schema")
         try:
             decoded = {key: _decode(value[key], allow_legacy_missing=allow_legacy_missing) for key in actual}
-            decoded.update({key: None for key in missing})
+            decoded.update({key: (() if key == "verification_commands" else
+                              models.EvidenceProvenance.AGENT_CLAIM if key == "provenance" else None)
+                            for key in missing})
             hints = typing.get_type_hints(cls)
             for key, annotation in hints.items():
                 if hasattr(annotation, "__supertype__"):
                     decoded[key] = annotation(decoded[key])
                 if not _matches_type(decoded[key], annotation):
                     raise StateStoreError("record field has invalid type")
+            if cls is models.ObservedCommandEvidence:
+                return cls._restore(**decoded)
             return cls(**decoded)
         except StateStoreError:
             raise
@@ -184,6 +189,24 @@ def _decode(value, *, allow_legacy_missing=False):
 
 def _record_json(record):
     return json.dumps(_encode(record), sort_keys=True, separators=(",", ":"))
+
+
+def _legacy_record_from_json(text):
+    """Decode legacy tagged state without treating old verification as trusted."""
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, UnicodeError, TypeError) as exc:
+        raise StateStoreError("corrupt state JSON") from exc
+    if not isinstance(raw, dict) or raw.get("$type") != "TaskStateRecord":
+        raise StateStoreError("unsupported legacy record type")
+    claimed = (bool(raw.get("verification", {}).get("$tuple", ()))
+               or raw.get("result_review") is not None or raw.get("handoff") is not None
+               or raw.get("state", {}).get("value") == models.TaskState.COMPLETED.value)
+    raw = dict(raw)
+    raw["verification"] = {"$tuple": []}
+    raw["result_review"] = None
+    raw["handoff"] = None
+    return _record_from_json(json.dumps(raw), allow_legacy_missing=True), claimed
 
 
 def _record_from_json(text, *, allow_legacy_missing=False):
@@ -223,7 +246,7 @@ class StateStore:
                 if not {"key", "value"}.issubset(metadata_columns):
                     raise StateStoreError("database schema metadata is malformed")
                 rows = connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchall()
-                if len(rows) != 1 or type(rows[0][0]) is not str or rows[0][0] not in ("1", str(_SCHEMA_VERSION)):
+                if len(rows) != 1 or type(rows[0][0]) is not str or rows[0][0] not in ("1", "2", "3", str(_SCHEMA_VERSION)):
                     raise StateStoreError("missing, malformed, or unsupported database schema version")
                 if "task_state" not in tables:
                     raise StateStoreError("database task state table is missing")
@@ -242,6 +265,10 @@ class StateStore:
                     raise StateStoreError("database task state schema is malformed or incompatible")
                 if rows[0][0] == "1":
                     self._migrate_v1(connection)
+                if rows[0][0] in ("1", "2"):
+                    self._migrate_v2(connection)
+                if rows[0][0] in ("1", "2", "3"):
+                    self._migrate_v3(connection)
                 self._validate_audit_schema(connection)
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -371,6 +398,62 @@ class StateStore:
         cls._create_audit_schema(connection)
         connection.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
 
+    @classmethod
+    def _migrate_v2(cls, connection):
+        """Install the structured-command Plan shape and revoke legacy verification claims."""
+        for task_id, payload in connection.execute("SELECT task_id,payload FROM task_state").fetchall():
+            record, legacy_claim = _legacy_record_from_json(payload)
+            if str(record.task_id) != task_id:
+                raise StateStoreError("task ID does not match stored key")
+            has_legacy_completion_claim = legacy_claim
+            terminal = record.state in {models.TaskState.COMPLETED, models.TaskState.CANCELLED,
+                                        models.TaskState.REJECTED, models.TaskState.FAILED}
+            digest_changed = record.plan is not None and record.plan_digest != canonical_plan_digest(record.plan)
+            must_revoke = has_legacy_completion_claim or record.state is models.TaskState.COMPLETED or (
+                digest_changed and not terminal)
+            if must_revoke:
+                if record.plan is None:
+                    record = replace(record, state=models.TaskState.FAILED, verification=(), result_review=None,
+                                     handoff=None, history=record.history + ((models.TaskState.FAILED,) if not record.history or record.history[-1] is not models.TaskState.FAILED else ()),
+                                     approval=None, approval_request=None, permit=None,
+                                     plan_review=None, mutation_proposal=None, mutation_authorization=None,
+                                     blast_radius=None)
+                else:
+                    record = replace(record, state=models.TaskState.PLAN,
+                        revision=models.PlanRevision(int(record.revision) + 1),
+                        plan_digest=canonical_plan_digest(record.plan), verification=(), result_review=None,
+                        handoff=None, approval=None, approval_request=None, permit=None, plan_review=None,
+                        mutation_proposal=None, mutation_authorization=None, blast_radius=None, child_leases=(),
+                        history=record.history + ((models.TaskState.PLAN,) if record.state is not models.TaskState.PLAN else ()))
+            elif digest_changed:
+                # Terminal rejected/cancelled/failed records are preserved, but
+                # their unused cached plan digest must still match the new schema.
+                record = replace(record, plan_digest=canonical_plan_digest(record.plan))
+            connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(record), task_id))
+        connection.execute("UPDATE metadata SET value='3' WHERE key='schema_version'")
+
+    @classmethod
+    def _migrate_v3(cls, connection):
+        for task_id, payload in connection.execute("SELECT task_id,payload FROM task_state").fetchall():
+            record, legacy_claim = _legacy_record_from_json(payload)
+            if str(record.task_id) != task_id:
+                raise StateStoreError("task ID does not match stored key")
+            claimed = legacy_claim
+            if claimed:
+                if record.plan is None:
+                    record = replace(record, state=models.TaskState.FAILED, verification=(), result_review=None, handoff=None,
+                                     history=record.history + ((models.TaskState.FAILED,) if not record.history or record.history[-1] is not models.TaskState.FAILED else ()),
+                                     approval=None, approval_request=None, permit=None, plan_review=None, mutation_proposal=None,
+                                     mutation_authorization=None, blast_radius=None)
+                else:
+                    record = replace(record, state=models.TaskState.PLAN, revision=models.PlanRevision(int(record.revision)+1),
+                                     plan_digest=canonical_plan_digest(record.plan), verification=(), result_review=None,
+                                     handoff=None, approval=None, approval_request=None, permit=None, plan_review=None,
+                                     mutation_proposal=None, mutation_authorization=None, blast_radius=None, child_leases=(),
+                                     history=record.history + ((models.TaskState.PLAN,) if record.state is not models.TaskState.PLAN else ()))
+            connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(record), task_id))
+        connection.execute("UPDATE metadata SET value='4' WHERE key='schema_version'")
+
     @staticmethod
     def _tagged_v1_record(payload):
         """Decode a tagged v1 record mapping, allowing only known v1 fields."""
@@ -384,9 +467,21 @@ class StateStore:
             raise StateStoreError("unsupported legacy record type")
         expected = {field.name for field in fields(TaskStateRecord)}
         actual = set(raw) - {"$type"}
-        if actual - expected or expected - actual - {"mutation_proposal", "mutation_authorization"}:
+        if actual - expected or expected - actual - {"mutation_proposal", "mutation_authorization", "verification_commands"}:
             raise StateStoreError("unsupported legacy record fields")
-        record = _record_from_json(payload, allow_legacy_missing=True)
+        record, legacy_claim = _legacy_record_from_json(payload)
+        if legacy_claim or record.state is models.TaskState.COMPLETED:
+            if record.plan is None:
+                record = replace(record, state=models.TaskState.FAILED,
+                    history=record.history + ((models.TaskState.FAILED,) if not record.history or record.history[-1] is not models.TaskState.FAILED else ()),
+                    approval=None, approval_request=None, permit=None, plan_review=None,
+                    mutation_proposal=None, mutation_authorization=None, blast_radius=None)
+            else:
+                record = replace(record, state=models.TaskState.PLAN,
+                    revision=models.PlanRevision(int(record.revision) + 1), plan_digest=canonical_plan_digest(record.plan),
+                    approval=None, approval_request=None, permit=None, plan_review=None,
+                    mutation_proposal=None, mutation_authorization=None, blast_radius=None, child_leases=(),
+                    history=record.history + ((models.TaskState.PLAN,) if record.state is not models.TaskState.PLAN else ()))
         if record.plan is not None and record.plan.workspace_identity is None:
             active = record.state not in {models.TaskState.COMPLETED, models.TaskState.CANCELLED,
                                           models.TaskState.REJECTED, models.TaskState.FAILED}
@@ -395,8 +490,8 @@ class StateStore:
             if active:
                 record = replace(record, state=models.TaskState.PLAN, revision=models.PlanRevision(int(record.revision) + 1),
                     history=record.history + (models.TaskState.PLAN,), approval=None, approval_request=None,
-                    permit=None, plan_review=None, result_review=None, mutation_proposal=None,
-                    mutation_authorization=None, blast_radius=None, verification=(), handoff=None, child_leases=())
+                    permit=None, plan_review=None, mutation_proposal=None, mutation_authorization=None,
+                    blast_radius=None, child_leases=())
             else:
                 record = replace(record, approval=None, approval_request=None, permit=None,
                     mutation_proposal=None, mutation_authorization=None)
@@ -512,6 +607,32 @@ class StateStore:
             if str(current.task_id) != str(task_id):
                 raise StateStoreError("task ID does not match stored key")
             updated = record_approval(current, receipt)
+            connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(updated), str(task_id)))
+            connection.commit()
+            return updated
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _record_gate_verification(self, task_id: TaskID | str, *, expected_revision, expected_plan_digest, observations):
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT payload FROM task_state WHERE task_id=?", (str(task_id),)).fetchone()
+            if row is None:
+                raise StateStoreError("task not found")
+            current = _record_from_json(row[0])
+            if (str(current.task_id) != str(task_id) or current.state is not models.TaskState.IMPLEMENTING
+                    or current.revision != expected_revision or current.plan_digest != expected_plan_digest
+                    or current.plan is None or current.plan_digest != canonical_plan_digest(current.plan)
+                    or current.plan.workspace_identity is None
+                    or capture_workspace_identity(current.plan.workspace_root) != current.plan.workspace_identity):
+                raise StateStoreError("verification context is stale or workspace identity changed")
+            updated = _record_gate_observed_verification(current, observations)
+            if capture_workspace_identity(current.plan.workspace_root) != current.plan.workspace_identity:
+                raise StateStoreError("workspace identity changed during verification persistence")
             connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(updated), str(task_id)))
             connection.commit()
             return updated

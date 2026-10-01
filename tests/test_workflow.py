@@ -5,11 +5,47 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
-from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, InspectionEvidenceRef, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation, OperationKind, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity, ResultReview, ReviewVerdict, TaskState, TaskStateRecord, VerificationResult, WorkspaceIdentity)
-from engineering_gate_core.workflow import Stage, new_task, transition, Event, TransitionError, record_approval, revise_plan, canonical_plan_digest, canonical_mutation_proposal_digest, mutation_argument_digest, record_mutation_proposal, record_mutation_authorization, capture_workspace_identity
+from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, InspectionEvidenceRef, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation, OperationKind, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity, ResultReview, ReviewVerdict, TaskState, TaskStateRecord, VerificationResult, VerificationCommand, WorkspaceIdentity, ObservedCommandEvidence, _ISSUER)
+from engineering_gate_core.workflow import Stage, new_task, transition, Event, TransitionError, record_approval, revise_plan, canonical_plan_digest, canonical_mutation_proposal_digest, mutation_argument_digest, record_mutation_proposal, record_mutation_authorization, capture_workspace_identity, resolve_approved_verification_commands
 
 
 class WorkflowTests(unittest.TestCase):
+    def observed(self, criterion="c", passed=True):
+        from hashlib import sha256
+        return ObservedCommandEvidence._issue(
+            _issuer=_ISSUER, task_id="test-task", plan_revision=1, plan_digest="0" * 64,
+            criterion_id=criterion, argv=("test-command",),
+            workspace_identity=WorkspaceIdentity("/test-only", 1, 1),
+            started_at="2026-10-01T10:00:00Z", completed_at="2026-10-01T10:00:01Z",
+            exit_code=0 if passed else 1, stdout_digest=sha256(b"out").hexdigest(),
+            stderr_digest=sha256(b"").hexdigest(), output_summary="test-only", timed_out=False)
+
+    def test_verification_command_fields_are_bound_to_plan_digest(self):
+        command = VerificationCommand(("pytest", "tests/test_x.py"), ("c",), 30, 4096)
+        plan = Plan("x", (), (AcceptanceCriterion("c", "works", "run"), AcceptanceCriterion("other", "other", "run")), (), verification_commands=(command,))
+        digest = canonical_plan_digest(plan)
+        for changed in (__import__("dataclasses").replace(command, argv=("pytest", "-q")),
+                        __import__("dataclasses").replace(command, criterion_ids=("other",)),
+                        __import__("dataclasses").replace(command, timeout_seconds=31),
+                        __import__("dataclasses").replace(command, output_cap_bytes=4097)):
+            self.assertNotEqual(digest, canonical_plan_digest(__import__("dataclasses").replace(plan, verification_commands=(changed,))))
+
+    def test_verification_command_rejects_shell_strings_and_bad_criterion_mapping(self):
+        for argv in ("pytest -q", (), ("pytest", ""), ("pytest", 3)):
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                VerificationCommand(argv, ("c",), 30, 4096)
+        with self.assertRaises(ValueError):
+            Plan("x", (), (AcceptanceCriterion("c", "works", "run"),), (),
+                 verification_commands=(VerificationCommand(("pytest",), ("missing",), 30, 4096),))
+
+    def test_resolver_returns_only_commands_for_current_criterion(self):
+        commands = (VerificationCommand(("pytest", "a"), ("a",), 30, 4096),
+                    VerificationCommand(("pytest", "b"), ("b",), 30, 4096))
+        plan = Plan("x", (), (AcceptanceCriterion("a", "A", "run"), AcceptanceCriterion("b", "B", "run")), (), verification_commands=commands)
+        self.assertEqual(resolve_approved_verification_commands(plan, ("a",)), (commands[0],))
+        with self.assertRaises(TransitionError):
+            resolve_approved_verification_commands(plan, ("missing",))
+
     def test_mutation_proposal_and_authorization_bind_to_live_implementing_plan(self):
         op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update output")
         import tempfile
@@ -175,7 +211,7 @@ class WorkflowTests(unittest.TestCase):
                          InspectionEvidenceRef("ev-1", "baseline snapshot"))
         self.assertEqual(task.state, TaskState.ANALYZE)
         self.assertEqual(task.inspection.evidence_id, "ev-1")
-    def test_approved_lifecycle_reaches_completed_without_skipping(self):
+    def test_caller_transition_cannot_record_verification(self):
         task = new_task("task-2", "Add feature", RequesterIdentity("user-2"))
         task = transition(task, Event.INSPECTION_RECORDED, InspectionEvidenceRef("i", "baseline"))
         task = transition(task, Event.ANALYSIS_RECORDED, Evidence("a", "findings"))
@@ -191,12 +227,8 @@ class WorkflowTests(unittest.TestCase):
         task = record_approval(task, receipt)
         permit = ExecutionPermit(task.task_id, task.revision, task.plan_digest, MutationScope((operation,)))
         task = transition(task, Event.IMPLEMENTATION_STARTED, permit)
-        result = VerificationResult("AC-1", (Evidence("check", "tests passed", True),), True)
-        task = transition(task, Event.VERIFICATION_RECORDED, (result,))
-        task = transition(task, Event.RESULT_REVIEW_PASSED, ResultReview(ReviewVerdict.PASS))
-        task = transition(task, Event.HANDOFF_RECORDED, Handoff("Implemented and verified", (Evidence("h", "reviewed"),)))
-        self.assertEqual(task.state, TaskState.COMPLETED)
-        self.assertEqual(task.verification, (result,))
+        with self.assertRaises(TransitionError):
+            transition(task, Event.VERIFICATION_RECORDED, ())
 
     def test_approval_receipt_must_match_requester_and_plan_binding(self):
         task = new_task("task-3", "Add feature", RequesterIdentity("requester"))
@@ -214,7 +246,7 @@ class WorkflowTests(unittest.TestCase):
                                task.history + (TaskState.ANALYZE, TaskState.PLAN, TaskState.BLAST_RADIUS,
                                                TaskState.PLAN_REVIEW, TaskState.AWAITING_APPROVAL, TaskState.APPROVED,
                                                TaskState.IMPLEMENTING, TaskState.VERIFYING),
-                               verification=(VerificationResult("AC", (Evidence("v", "failed", False),), False),))
+                               verification=(VerificationResult("AC", (self.observed("AC", False),)),))
         updated = transition(task, Event.IMPLEMENTATION_FIX_REQUIRED,
                              ResultReview(ReviewVerdict.IMPLEMENT_FIX, ("repair defect",)))
         self.assertEqual(updated.state, TaskState.IMPLEMENTING)
@@ -283,14 +315,14 @@ class WorkflowTests(unittest.TestCase):
     def test_result_review_requires_all_passed_evidence(self):
         plan = Plan("x", (NormalizedOperation(OperationKind.READ, "a"),), (AcceptanceCriterion("c", "works", "test"), AcceptanceCriterion("d", "safe", "audit")), ("test",))
         task = TaskStateRecord(new_task("e", "x", RequesterIdentity("u")).task, TaskState.VERIFYING, 1, (TaskState.VERIFYING,), plan=plan)
-        for results in ((), (VerificationResult("c", (Evidence("ev", "claim", True),), True),), (VerificationResult("c", (Evidence("ev", "failed", False),), False), VerificationResult("d", (Evidence("ev2", "ok", True),), True)), (VerificationResult("c", (), True), VerificationResult("d", (Evidence("d", "ok", True),), True))):
+        for results in ((), (VerificationResult("c", (self.observed("c"),)),), (VerificationResult("c", (self.observed("c", False),)), VerificationResult("d", (self.observed("d"),))), (VerificationResult("c", (self.observed("c"),)), VerificationResult("d", (self.observed("d"),)))):
             task = TaskStateRecord(task.task, task.state, task.revision, task.history, plan=plan, verification=results)
             with self.assertRaises(TransitionError): transition(task, Event.RESULT_REVIEW_PASSED, ResultReview(ReviewVerdict.PASS))
 
     def test_verification_requires_evidence_for_current_unique_criteria(self):
         plan = Plan("x", (NormalizedOperation(OperationKind.READ, "a"),), (AcceptanceCriterion("c", "works", "test"),), ("test",))
         task = TaskStateRecord(new_task("e2", "x", RequesterIdentity("u")).task, TaskState.IMPLEMENTING, 1, (TaskState.IMPLEMENTING,), plan=plan)
-        for results in ((VerificationResult("other", (Evidence("e", "x"),), True),), (VerificationResult("c", (), True),), (VerificationResult("c", (Evidence("e", "x"),), True), VerificationResult("c", (Evidence("e2", "y"),), True))):
+        for results in ((VerificationResult("other", (self.observed("other"),)),), (VerificationResult("c", (self.observed("c"),)),), (VerificationResult("c", (self.observed("c"),)), VerificationResult("c", (self.observed("c"),)))):
             with self.assertRaises(TransitionError): transition(task, Event.VERIFICATION_RECORDED, results)
 
     def test_handoff_requires_evidence(self):
@@ -380,7 +412,7 @@ class WorkflowTests(unittest.TestCase):
             plan=plan, plan_digest=digest, blast_radius=Evidence("br", "impact"),
             plan_review=PlanReview(ReviewVerdict.APPROVED), approval_request=request,
             approval=receipt, permit=permit,
-            verification=(VerificationResult("c", (Evidence("check", "result", True),), False),),
+            verification=(VerificationResult("c", (self.observed("c"),)),),
         )
         revised = transition(task, Event.REPLAN_REQUIRED, ResultReview(ReviewVerdict.REPLAN))
         self.assertEqual(revised.state, TaskState.PLAN)
@@ -415,12 +447,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertIsNone(revised.mutation_authorization)
             checks = (
                 (TaskStateRecord(base.task, TaskState.VERIFYING, 1, (TaskState.VERIFYING,), **common,
-                    verification=(VerificationResult("c", (Evidence("e", "failed", False),), False),)),
+                    verification=(VerificationResult("c", (self.observed("c", False),)),)),
                  Event.REPLAN_REQUIRED, ResultReview(ReviewVerdict.REPLAN)),
                 (TaskStateRecord(base.task, TaskState.PLAN_REVIEW, 1, (TaskState.PLAN_REVIEW,), **common),
                  Event.PLAN_REVIEW_FAILED, PlanReview(ReviewVerdict.NEEDS_CHANGES)),
                 (TaskStateRecord(base.task, TaskState.VERIFYING, 1, (TaskState.VERIFYING,), **common,
-                    verification=(VerificationResult("c", (Evidence("e", "failed", False),), False),)),
+                    verification=(VerificationResult("c", (self.observed("c", False),)),)),
                  Event.IMPLEMENTATION_FIX_REQUIRED, ResultReview(ReviewVerdict.IMPLEMENT_FIX)),
             )
             for state, event, payload in checks:
@@ -435,16 +467,26 @@ class WorkflowTests(unittest.TestCase):
                     ("test",))
         task = TaskStateRecord(new_task("complete-verification", "x", RequesterIdentity("u")).task,
                                TaskState.IMPLEMENTING, PlanRevision(1), (TaskState.IMPLEMENTING,), plan=plan)
-        partial = (VerificationResult("c", (Evidence("ev", "actual test output", True),), True),)
+        partial = (VerificationResult("c", (self.observed("c"),)),)
         with self.assertRaises(TransitionError):
             transition(task, Event.VERIFICATION_RECORDED, partial)
+
+    def test_generic_passed_evidence_cannot_satisfy_verification(self):
+        plan = Plan("x", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        task = TaskStateRecord(new_task("generic-claim", "x", RequesterIdentity("u")).task,
+                               TaskState.IMPLEMENTING, 1, (TaskState.IMPLEMENTING,), plan=plan)
+        with self.assertRaises(ValueError):
+            VerificationResult("c", (Evidence("ev", "trust me", True),))
+        with self.assertRaises(TransitionError):
+            transition(task, Event.VERIFICATION_RECORDED, ())
 
     def test_result_review_rejects_failed_evidence_claimed_as_passed(self):
         plan = Plan("x", (NormalizedOperation(OperationKind.READ, "a"),),
                     (AcceptanceCriterion("c", "works", "test"),), ("test",))
         task = TaskStateRecord(new_task("contradictory-evidence", "x", RequesterIdentity("u")).task,
                                TaskState.VERIFYING, PlanRevision(1), (TaskState.VERIFYING,), plan=plan,
-                               verification=(VerificationResult("c", (Evidence("ev", "failed test output", False),), True),))
+                               verification=(VerificationResult("c", (self.observed("c", False),)),))
         with self.assertRaises(TransitionError):
             transition(task, Event.RESULT_REVIEW_PASSED, ResultReview(ReviewVerdict.PASS))
 
@@ -466,7 +508,7 @@ class WorkflowTests(unittest.TestCase):
         task = new_task("fix-findings", "x", RequesterIdentity("u"))
         fix_task = TaskStateRecord(
             task.task, TaskState.VERIFYING, PlanRevision(1), (TaskState.VERIFYING,),
-            verification=(VerificationResult("c", (Evidence("ev", "failed", False),), False),),
+            verification=(VerificationResult("c", (self.observed("c", False),)),),
         )
         review = ResultReview(ReviewVerdict.IMPLEMENT_FIX, ("handle empty input",))
         result = transition(fix_task, Event.IMPLEMENTATION_FIX_REQUIRED, review)

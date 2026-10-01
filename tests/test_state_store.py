@@ -689,8 +689,124 @@ class StateStoreTests(unittest.TestCase):
         reopened = StateStore(self.path)
         self.assertEqual(reopened.load("task-1"), self.record)
         with sqlite3.connect(self.path) as db:
-            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "2")
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "4")
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_audit'").fetchone())
+
+    def test_v3_migration_sanitizes_legacy_nested_result_and_is_idempotent(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import (AcceptanceCriterion, NormalizedOperation, OperationKind,
+            Plan, PlanRevision, TaskState)
+        from engineering_gate_core.workflow import canonical_plan_digest
+        store = StateStore(self.path); store.create(self.record)
+        plan = Plan("old", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        completed = replace(self.record, state=TaskState.COMPLETED, revision=PlanRevision(7), plan=plan,
+                            plan_digest=canonical_plan_digest(plan))
+        raw = json.loads(_record_json(completed))
+        raw["verification"] = {"$tuple": [{"$type": "VerificationResult", "criterion_id": "c",
+            "evidence": {"$tuple": [{"$type": "Evidence", "source": "old", "detail": "legacy pass", "passed": True}]},
+            "passed": True}]}
+        raw["plan"].pop("verification_commands")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='3' WHERE key='schema_version'")
+        migrated = StateStore(self.path).load("task-1")
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(migrated.state, TaskState.PLAN)
+        self.assertEqual(int(migrated.revision), 8)
+        self.assertEqual(migrated.verification, ())
+        self.assertIsNone(migrated.result_review)
+        self.assertIsNone(migrated.handoff)
+        self.assertEqual(migrated, reopened)
+
+    def test_v2_migration_invalidates_legacy_verification_and_reopens_completion(self):
+        import sqlite3
+        import json
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import (AcceptanceCriterion, NormalizedOperation, OperationKind,
+            Plan, PlanRevision, TaskState)
+        from engineering_gate_core.workflow import canonical_plan_digest
+        store = StateStore(self.path); store.create(self.record)
+        plan = Plan("old", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        completed = replace(self.record, state=TaskState.COMPLETED, revision=PlanRevision(1), plan=plan,
+            plan_digest=canonical_plan_digest(plan))
+        with sqlite3.connect(self.path) as db:
+            raw = json.loads(_record_json(completed))
+            raw["plan"].pop("verification_commands")
+            raw["verification"] = {"$tuple": [{"$type": "VerificationResult", "criterion_id": "c",
+                "evidence": {"$tuple": [{"$type": "Evidence", "source": "old", "detail": "legacy pass", "passed": True}]},
+                "passed": True}]}
+            raw["result_review"] = {"$type": "ResultReview", "verdict": {"$enum": "ReviewVerdict", "value": "pass"}, "notes": "legacy"}
+            raw["handoff"] = {"$type": "Handoff", "summary": "done", "evidence": {"$tuple": []}}
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(reopened.state, TaskState.PLAN)
+        self.assertEqual(reopened.revision, 2)
+        self.assertEqual(reopened.verification, ())
+        self.assertIsNone(reopened.result_review)
+        self.assertIsNone(reopened.handoff)
+
+    def test_v2_migration_revokes_active_records_when_legacy_plan_digest_changes(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import Plan, AcceptanceCriterion, NormalizedOperation, OperationKind, PlanRevision, PlanDigest
+        from engineering_gate_core.workflow import canonical_plan_digest
+
+        store = StateStore(self.path)
+        store.create(self.record)
+        plan = Plan("inspect", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "ok", "test"),), ("test",))
+        active = replace(self.record, state=TaskState.APPROVED, revision=PlanRevision(4), plan=plan,
+                         plan_digest=PlanDigest("a" * 64))
+        raw = json.loads(_record_json(active))
+        raw["plan"].pop("verification_commands")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(reopened.state, TaskState.PLAN)
+        self.assertEqual(reopened.revision, 5)
+        self.assertEqual(reopened.plan_digest, canonical_plan_digest(reopened.plan))
+        self.assertIsNone(reopened.approval)
+        self.assertIsNone(reopened.approval_request)
+        self.assertIsNone(reopened.permit)
+        self.assertIsNone(reopened.mutation_proposal)
+        self.assertIsNone(reopened.mutation_authorization)
+        self.assertIsNone(reopened.plan_review)
+        self.assertIsNone(reopened.result_review)
+        self.assertIsNone(reopened.blast_radius)
+        self.assertEqual(reopened.verification, ())
+
+    def test_v2_plan_with_stale_digest_is_reopened_consistently(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import Plan, AcceptanceCriterion, NormalizedOperation, OperationKind, PlanDigest
+        from engineering_gate_core.workflow import canonical_plan_digest
+
+        store = StateStore(self.path)
+        store.create(self.record)
+        plan = Plan("inspect", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "ok", "test"),), ("test",))
+        legacy = replace(self.record, state=TaskState.PLAN, plan=plan, plan_digest=PlanDigest("b" * 64))
+        raw = json.loads(_record_json(legacy))
+        raw["plan"].pop("verification_commands")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(reopened.state, TaskState.PLAN)
+        self.assertEqual(reopened.revision, int(legacy.revision) + 1)
+        self.assertEqual(reopened.plan_digest, canonical_plan_digest(plan))
+        self.assertEqual(reopened.verification, ())
 
     def test_v1_tagged_nested_plan_missing_identity_is_invalidated_only(self):
         import json, sqlite3
