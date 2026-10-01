@@ -68,7 +68,13 @@ def _digest(arguments: Any) -> str:
 
 
 class GateWriteService:
-    """Issue one-use permits and execute authorized writes beneath a pinned root.
+    """Issue one-use permits and execute writes beneath a pinned root.
+
+    Parent directories are opened component-by-component beneath the pinned root;
+    all mutation and readback use the pinned leaf-parent descriptor. A concurrent
+    rename after the last edge check can therefore leave the write in a detached
+    directory, which is audited and reported rather than redirected. This is not
+    protection against a hostile same-UID process or OS-level compromise.
 
     The injected verifier is a trusted host/provider boundary; None fails closed.
     This library does not authenticate humans. Do not expose service construction
@@ -124,10 +130,11 @@ class GateWriteService:
         if not isinstance(operation, NormalizedOperation) or operation.kind is not OperationKind.WRITE:
             raise PermissionError("unsupported operation")
         target = operation.target
-        if (not isinstance(target, str) or not target or target in (".", "..")
-                or "/" in target or "\\" in target or "\x00" in target
-                or Path(target).is_absolute()):
-            raise PermissionError("write target must be one root-level filename")
+        from .models import _validate_relative_target
+        try:
+            _validate_relative_target(target)
+        except ValueError as exc:
+            raise PermissionError("write target must be a canonical relative POSIX path") from exc
         decision = authorize_invocation(state, operation, self._root)
         if decision.action is not PolicyAction.ALLOW:
             raise PermissionError(f"invocation is not authorized: {decision.reason}")
@@ -235,15 +242,44 @@ class GateWriteService:
             if not isinstance(arguments, dict) or set(arguments) != {"content"} or not isinstance(arguments["content"], str):
                 raise ValueError("write arguments must contain only string content")
 
-            relative = Path(operation.target)
+            components = operation.target.split("/")
             required = ("O_DIRECTORY", "O_NOFOLLOW", "supports_dir_fd")
             if not all(hasattr(os, name) for name in required) or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd or os.rename not in os.supports_dir_fd:
                 raise PermissionError("platform lacks safe descriptor-relative filesystem operations")
             directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             temp_name: str | None = None
-            parent_fd = os.dup(self._root_fd)
+            pinned_fds = [os.dup(self._root_fd)]
+            parent_fd = pinned_fds[0]
             try:
-                name = relative.parts[-1]
+                for component in components[:-1]:
+                    child_fd = os.open(component, directory_flags, dir_fd=pinned_fds[-1])
+                    child_info = os.fstat(child_fd)
+                    if not stat.S_ISDIR(child_info.st_mode):
+                        os.close(child_fd)
+                        raise PermissionError("target parent is not a directory")
+                    pinned_fds.append(child_fd)
+                parent_fd = pinned_fds[-1]
+                name = components[-1]
+                pinned_edges = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in pinned_fds]
+
+                def parent_chain_matches() -> bool:
+                    check_fd = os.dup(self._root_fd)
+                    try:
+                        if (os.fstat(check_fd).st_dev, os.fstat(check_fd).st_ino) != pinned_edges[0]:
+                            return False
+                        for index, component in enumerate(components[:-1], 1):
+                            next_fd = os.open(component, directory_flags, dir_fd=check_fd)
+                            info = os.fstat(next_fd)
+                            os.close(check_fd)
+                            check_fd = next_fd
+                            if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != pinned_edges[index]:
+                                return False
+                        return True
+                    except OSError:
+                        return False
+                    finally:
+                        os.close(check_fd)
+
                 try:
                     existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 except FileNotFoundError:
@@ -286,9 +322,13 @@ class GateWriteService:
                         raise TypeError("authorization lease must be a context manager")
                     with lease:
                         self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
+                        if not parent_chain_matches():
+                            raise WorkspacePathDetached("workspace parent path detached before replacement")
                         os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                         replacement_completed = True
                 except PermissionError:
+                    raise
+                except WorkspacePathDetached:
                     raise
                 except Exception as exc:
                     raise PermissionError("provider authorization lease could not be acquired") from exc
@@ -296,6 +336,8 @@ class GateWriteService:
                 temp_name = None
                 try:
                     self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
+                    if not parent_chain_matches():
+                        detached = True
                 except PermissionError:
                     detached = True
                 observed_fd = None
@@ -337,7 +379,8 @@ class GateWriteService:
                         os.unlink(temp_name, dir_fd=parent_fd)
                     except FileNotFoundError:
                         pass
-                os.close(parent_fd)
+                for pinned_fd in reversed(pinned_fds):
+                    os.close(pinned_fd)
             audit = ExecutionAuditRecord(
                 audit_id=str(uuid4()), task_id=state.task_id, revision=state.revision,
                 plan_digest=str(state.plan_digest), proposal_digest=proposal_digest,
