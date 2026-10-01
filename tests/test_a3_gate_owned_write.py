@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 import unittest
 from pathlib import Path
 
@@ -8,8 +9,41 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
 from engineering_gate_core.a3_execution import GateWriteService
-from engineering_gate_core.models import (ApprovalReceipt, ExecutionPermit, MutationScope, NormalizedOperation, OperationKind, Plan, Task, TaskState, TaskStateRecord, RequesterIdentity)
-from engineering_gate_core.workflow import canonical_plan_digest, capture_workspace_identity
+from datetime import datetime, timezone
+from dataclasses import replace
+from engineering_gate_core.models import (ApprovalReceipt, ApprovalRequest, ExecutionPermit, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation, OperationKind, Plan, PlanReview, ReviewVerdict, Task, TaskState, TaskStateRecord, RequesterIdentity)
+from engineering_gate_core.workflow import canonical_plan_digest, canonical_mutation_proposal_digest, mutation_argument_digest, record_mutation_authorization, record_mutation_proposal, capture_workspace_identity
+
+
+class SyntheticAuthorizationProvider:
+    """Test-only registry; it does not authenticate a human approver."""
+
+    def __init__(self):
+        self._approvals = set()
+        self._lock = threading.Lock()
+
+    def issue(self, authorization):
+        with self._lock:
+            self._approvals.add(authorization)
+
+    def revoke(self, authorization_id):
+        with self._lock:
+            self._approvals = {approval for approval in self._approvals if approval.authorization_id != authorization_id}
+
+    def verify(self, authorization, proposal):
+        with self._lock:
+            return (authorization in self._approvals and
+                    authorization.proposal_digest == canonical_mutation_proposal_digest(proposal))
+
+    @contextmanager
+    def acquire_lease(self, authorization, proposal):
+        self._lock.acquire()
+        try:
+            if not (authorization in self._approvals and authorization.proposal_digest == canonical_mutation_proposal_digest(proposal)):
+                raise PermissionError("authorization revoked")
+            yield
+        finally:
+            self._lock.release()
 
 
 class GateOwnedWriteTests(unittest.TestCase):
@@ -18,13 +52,18 @@ class GateOwnedWriteTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.states = {}
+        self.authorization_provider = SyntheticAuthorizationProvider()
         self.transaction_calls = 0
         def state_transaction(task_id, callback):
             self.transaction_calls += 1
             return callback(self.states[task_id])
         self.state_transaction = state_transaction
         self.service = GateWriteService(self.root, state_loader=self.states.__getitem__,
-                                        state_transaction=state_transaction)
+                                        state_transaction=state_transaction,
+                                        authorization_verifier=self.authorization_provider.verify,
+                                        authorization_lease_provider=self.authorization_provider.acquire_lease,
+                                        clock=lambda: datetime(2026, 10, 1, 12, tzinfo=timezone.utc))
+        self.addCleanup(self.service.close)
 
     def state_for(self, operation=None, state=TaskState.IMPLEMENTING, task_id="task-1", revision=1):
         operation = operation or NormalizedOperation(OperationKind.WRITE, "approved.txt")
@@ -34,8 +73,20 @@ class GateOwnedWriteTests(unittest.TestCase):
         digest = canonical_plan_digest(plan)
         approval = ApprovalReceipt("req-1", task_id, revision, digest, task.requester, True)
         permit = ExecutionPermit(task_id, revision, digest, MutationScope((operation,)))
+        approval_request = ApprovalRequest(task_id, revision, digest, "req-1")
         record = TaskStateRecord(task, state, revision, (), plan=plan, plan_digest=digest,
+                                 plan_review=PlanReview(ReviewVerdict.APPROVED), approval_request=approval_request,
                                  approval=approval, permit=permit)
+        if state is TaskState.IMPLEMENTING and operation.kind is OperationKind.WRITE and "/" not in operation.target and "\\" not in operation.target and operation.target not in (".", ".."):
+            content = "approved"
+            proposal = MutationProposal("proposal-1", task_id, revision, digest, operation,
+                                        mutation_argument_digest(content), "test-only reviewed proposal")
+            record = record_mutation_proposal(record, proposal)
+            authorization = MutationAuthorization("auth-1", task_id, revision, digest,
+                canonical_mutation_proposal_digest(proposal), "synthetic-test-provider",
+                "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z")
+            self.authorization_provider.issue(authorization)
+            record = record_mutation_authorization(record, authorization, now="2026-10-01T12:00:00Z")
         self.states[task_id] = record
         return record
 
@@ -44,6 +95,81 @@ class GateOwnedWriteTests(unittest.TestCase):
 
     def state_for_revision_two(self):
         return self.state_for(revision=2)
+
+    def test_permit_issue_requires_reviewed_proposal_and_provider_authorization(self):
+        operation = NormalizedOperation(OperationKind.WRITE, "approved.txt")
+        state = self.state_for(operation)
+        self.states[state.task_id] = replace(state, mutation_proposal=None, mutation_authorization=None)
+        with self.assertRaises(PermissionError):
+            self.service.issue_permit(task_id=state.task_id, operation=operation,
+                                      arguments={"content": "approved"})
+
+    def test_authorization_expired_before_issue_is_denied(self):
+        self.service._clock = lambda: datetime(2026, 10, 2, 0, tzinfo=timezone.utc)
+        with self.assertRaises(PermissionError):
+            self.permit()
+
+    def test_verifier_false_nonboolean_and_exception_all_deny(self):
+        original = self.service._authorization_verifier
+        for verifier in (lambda auth, proposal: False, lambda auth, proposal: "yes",
+                         lambda auth, proposal: (_ for _ in ()).throw(RuntimeError("provider down")), None):
+            with self.subTest(verifier=verifier):
+                self.service._authorization_verifier = verifier
+                with self.assertRaises(PermissionError):
+                    self.permit()
+        self.service._authorization_verifier = original
+
+    def test_provider_rejects_forged_authority_id(self):
+        state = self.state_for()
+        authorization = state.mutation_authorization
+        forged = replace(authorization, authority_id="attacker")
+        self.assertFalse(self.authorization_provider.verify(forged, state.mutation_proposal))
+
+    def test_forged_authority_before_permit_issue_is_denied(self):
+        state = self.state_for()
+        forged = replace(state.mutation_authorization, authority_id="attacker")
+        self.states[state.task_id] = replace(state, mutation_authorization=forged)
+        with self.assertRaises(PermissionError):
+            self.permit(state=self.states[state.task_id])
+
+    def test_provider_rejects_forged_expiry_on_registered_authorization(self):
+        state = self.state_for()
+        authorization = state.mutation_authorization
+        forged = replace(authorization, expires_at="2026-10-03T00:00:00Z")
+        self.assertFalse(self.authorization_provider.verify(forged, state.mutation_proposal))
+
+    def test_forged_authorization_id_is_denied(self):
+        permit = self.permit()
+        state = self.states["task-1"]
+        self.states["task-1"] = replace(
+            state, mutation_authorization=replace(state.mutation_authorization, authorization_id="forged-auth-id"))
+        with self.assertRaises(PermissionError):
+            self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+
+    def test_provider_revocation_after_permit_issue_denies_execution(self):
+        permit = self.permit()
+        self.authorization_provider.revoke("auth-1")
+        with self.assertRaises(PermissionError):
+            self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+
+    def test_authorization_expiring_after_issue_denies_execution(self):
+        permit = self.permit()
+        self.service._clock = lambda: datetime(2026, 10, 2, 0, tzinfo=timezone.utc)
+        with self.assertRaises(PermissionError):
+            self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+
+    def test_proposal_replacement_after_issue_invalidates_permit(self):
+        permit = self.permit()
+        state = self.states["task-1"]
+        replacement = MutationProposal("proposal-replaced", state.task_id, state.revision,
+            state.plan_digest, NormalizedOperation(OperationKind.WRITE, "approved.txt"),
+            mutation_argument_digest("approved"), "replacement reviewed proposal")
+        self.states["task-1"] = record_mutation_proposal(state, replacement)
+        with self.assertRaises(PermissionError):
+            self.request(permit)
 
     def test_staging_filename_collision_never_writes_directly_to_target(self):
         import os
@@ -200,7 +326,8 @@ class GateOwnedWriteTests(unittest.TestCase):
                 with self.assertRaises(WorkspacePathDetached):
                     self.request(permit)
             self.assertEqual(len(transaction_finished), 1)
-            self.assertFalse(isinstance(transaction_finished[0], Exception))
+            self.assertTrue(transaction_finished[0].path_detached)
+            self.assertTrue(transaction_finished[0].audit_record.path_detached)
             self.assertEqual((moved / "approved.txt").read_text(), "approved")
             self.assertFalse((self.root / "approved.txt").exists())
         finally:
@@ -305,6 +432,118 @@ class GateOwnedWriteTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [self.root / "approved.txt"])
 
+    def test_pre_mutation_provider_revocation_retains_permit_for_retry(self):
+        import os
+        from unittest.mock import patch
+        permit = self.permit()
+        real_write = os.write
+        revoked = False
+        def write_then_revoke(fd, data):
+            nonlocal revoked
+            result = real_write(fd, data)
+            if not revoked:
+                revoked = True
+                self.authorization_provider.revoke("auth-1")
+            return result
+        with patch("engineering_gate_core.a3_execution.os.write", side_effect=write_then_revoke):
+            with self.assertRaises(PermissionError):
+                self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+        state = self.states["task-1"]
+        self.authorization_provider.issue(state.mutation_authorization)
+        self.assertEqual(self.request(permit).read_text(), "approved")
+
+    def test_revocation_waits_for_held_authorization_lease_through_replace(self):
+        import os
+        from unittest.mock import patch
+        permit = self.permit()
+        real_replace = os.replace
+        revoke_started, replaced = threading.Event(), threading.Event()
+        revoker = None
+        def replace_while_revocation_waits(*args, **kwargs):
+            nonlocal revoker
+            def revoke():
+                revoke_started.set()
+                self.authorization_provider.revoke("auth-1")
+            revoker = threading.Thread(target=revoke)
+            revoker.start()
+            self.assertTrue(revoke_started.wait(2))
+            result = real_replace(*args, **kwargs)
+            replaced.set()
+            return result
+        with patch("engineering_gate_core.a3_execution.os.replace", side_effect=replace_while_revocation_waits):
+            result = self.request(permit)
+        revoker.join(2)
+        self.assertFalse(revoker.is_alive())
+        self.assertTrue(replaced.is_set())
+        self.assertEqual(result.read_text(), "approved")
+
+    def test_missing_lease_provider_fails_closed_and_retains_permit(self):
+        permit = self.permit()
+        provider = self.service._authorization_lease_provider
+        self.service._authorization_lease_provider = None
+        with self.assertRaises(PermissionError):
+            self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+        self.service._authorization_lease_provider = provider
+        self.assertEqual(self.request(permit).read_text(), "approved")
+
+    def test_lease_acquisition_rejection_retains_permit_for_retry(self):
+        permit = self.permit()
+        provider = self.authorization_provider
+        reject = True
+        def acquire(auth, proposal):
+            if reject:
+                raise PermissionError("reservation unavailable")
+            return provider.acquire_lease(auth, proposal)
+        self.service._authorization_lease_provider = acquire
+        with self.assertRaises(PermissionError):
+            self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+        reject = False
+        self.assertEqual(self.request(permit).read_text(), "approved")
+
+    def test_pre_mutation_clock_rejection_retains_permit_for_retry(self):
+        permit = self.permit()
+        original_clock = self.service._clock
+        self.service._clock = lambda: (_ for _ in ()).throw(RuntimeError("clock unavailable"))
+        with self.assertRaises(RuntimeError):
+            self.request(permit)
+        self.assertFalse((self.root / "approved.txt").exists())
+        self.service._clock = original_clock
+        self.assertEqual(self.request(permit).read_text(), "approved")
+
+    def test_concurrent_execution_reserves_permit_once(self):
+        from unittest.mock import patch
+        permit = self.permit()
+        entered = threading.Event()
+        release = threading.Event()
+        outcomes = []
+        real_write = __import__("os").write
+        def paused_write(fd, data):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release filesystem write")
+            return real_write(fd, data)
+        def execute():
+            try:
+                outcomes.append(self.request(permit))
+            except Exception as exc:
+                outcomes.append(exc)
+        with patch("engineering_gate_core.a3_execution.os.write", side_effect=paused_write):
+            first = threading.Thread(target=execute)
+            first.start()
+            self.assertTrue(entered.wait(2))
+            second = threading.Thread(target=execute)
+            second.start()
+            second.join(2)
+            self.assertFalse(second.is_alive())
+            release.set()
+            first.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertEqual(sum(isinstance(item, Path) for item in outcomes), 1)
+        self.assertEqual(sum(isinstance(item, PermissionError) for item in outcomes), 1)
+
     def permit(self, **overrides):
         operation = overrides.pop("operation", NormalizedOperation(OperationKind.WRITE, overrides.pop("target", "approved.txt")))
         state = overrides.pop("state", self.state_for(operation))
@@ -322,6 +561,29 @@ class GateOwnedWriteTests(unittest.TestCase):
             raise TypeError(overrides)
         return self.service.execute(permit, task_id=state.task_id, operation=operation, arguments=arguments)
 
+    def test_lease_exit_failure_after_replace_consumes_permit(self):
+        from engineering_gate_core.a3_execution import MutationOutcomeUnknown
+
+        permit = self.permit()
+        provider = self.authorization_provider
+
+        class ExitFailureLease:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                raise RuntimeError("simulated lease release failure")
+
+        self.service._authorization_lease_provider = lambda auth, proposal: ExitFailureLease()
+
+        with self.assertRaises(MutationOutcomeUnknown):
+            self.request(permit)
+
+        self.assertEqual((self.root / "approved.txt").read_text(), "approved")
+        self.service._authorization_lease_provider = provider.acquire_lease
+        with self.assertRaises(PermissionError):
+            self.request(permit)
+
     def test_transaction_failure_after_write_reports_unknown_outcome(self):
         operation = NormalizedOperation(OperationKind.WRITE, "approved.txt")
         permit = self.permit(operation=operation)
@@ -337,6 +599,64 @@ class GateOwnedWriteTests(unittest.TestCase):
 
         self.assertEqual(type(raised.exception).__name__, "MutationOutcomeUnknown")
         self.assertTrue((self.root / "approved.txt").exists())
+
+    def test_audit_digest_comes_from_readback_bytes_after_replace(self):
+        import hashlib
+        import os
+        from unittest.mock import patch
+        from engineering_gate_core.a3_execution import MutationOutcomeUnknown
+
+        permit = self.permit()
+        real_replace = os.replace
+        real_write = os.write
+        def replace_then_modify(*args, **kwargs):
+            result = real_replace(*args, **kwargs)
+            target_fd = os.open("approved.txt", os.O_WRONLY, dir_fd=kwargs["dst_dir_fd"])
+            try:
+                os.ftruncate(target_fd, 0)
+                real_write(target_fd, b"observed bytes")
+            finally:
+                os.close(target_fd)
+            return result
+        audits = []
+        def transaction(task_id, callback):
+            outcome = callback(self.states[task_id])
+            audits.append(outcome.audit_record)
+            return outcome
+        self.service._state_transaction = transaction
+        with patch("engineering_gate_core.a3_execution.os.replace", side_effect=replace_then_modify):
+            self.request(permit)
+        self.assertEqual((self.root / "approved.txt").read_bytes(), b"observed bytes")
+        self.assertEqual(audits[0].resulting_artifact_digest, hashlib.sha256(b"observed bytes").hexdigest())
+
+    def test_replaced_readback_target_records_unknown_outcome(self):
+        import os
+        from unittest.mock import patch
+        from engineering_gate_core.a3_execution import MutationOutcomeUnknown
+        permit = self.permit()
+        real_read = os.read
+        swapped = False
+        def read_then_swap(fd, size):
+            nonlocal swapped
+            if not swapped:
+                target = self.root / "approved.txt"
+                target.rename(self.root / "displaced.txt")
+                target.write_bytes(b"replacement")
+                swapped = True
+            return real_read(fd, size)
+        audits = []
+        def transaction(task_id, callback):
+            result = callback(self.states[task_id])
+            audits.append(result.audit_record)
+            return result
+        self.service._state_transaction = transaction
+        with patch("engineering_gate_core.a3_execution.os.read", side_effect=read_then_swap):
+            with self.assertRaises(MutationOutcomeUnknown):
+                self.request(permit)
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].outcome.value, "outcome_unknown")
+        self.assertIsNone(audits[0].resulting_artifact_digest)
+        self.assertEqual(audits[0].error_class, "OSError")
 
     def test_valid_permit_writes_only_its_authorized_file(self):
         permit = self.permit()
@@ -355,10 +675,47 @@ class GateOwnedWriteTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.request(permit, target="other.txt")
 
-    def test_task_mismatch_is_rejected(self):
+    def test_task_mismatch_does_not_consume_valid_permit(self):
         permit = self.permit()
         with self.assertRaises(PermissionError):
             self.request(permit, state=self.state_for_other_task())
+        self.assertEqual(self.request(permit).read_text(), "approved")
+
+    def test_in_place_mutation_during_readback_records_unknown_outcome(self):
+        import os
+        from unittest.mock import patch
+        from engineering_gate_core.a3_execution import MutationOutcomeUnknown
+
+        permit = self.permit()
+        real_read = os.read
+        mutated = False
+        audits = []
+
+        def read_then_mutate(fd, size):
+            nonlocal mutated
+            data = real_read(fd, size)
+            if not mutated and data:
+                mutated = True
+                target_fd = os.open(self.root / "approved.txt", os.O_WRONLY)
+                try:
+                    os.pwrite(target_fd, b"!", 0)
+                finally:
+                    os.close(target_fd)
+            return data
+
+        def transaction(task_id, callback):
+            result = callback(self.states[task_id])
+            audits.append(result.audit_record)
+            return result
+
+        self.service._state_transaction = transaction
+        with patch("engineering_gate_core.a3_execution.os.read", side_effect=read_then_mutate):
+            with self.assertRaises(MutationOutcomeUnknown):
+                self.request(permit)
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].outcome.value, "outcome_unknown")
+        self.assertIsNone(audits[0].resulting_artifact_digest)
+        self.assertEqual(audits[0].error_class, "OSError")
 
     def test_plan_revision_mismatch_is_rejected(self):
         permit = self.permit()

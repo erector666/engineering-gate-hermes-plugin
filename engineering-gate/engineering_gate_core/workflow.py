@@ -3,13 +3,14 @@ from dataclasses import replace
 from enum import Enum
 import hashlib
 import json
+from datetime import datetime, timezone
 import os
 import stat
 from pathlib import Path
 
-from .models import (ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff,
+from .models import (ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, MutationAuthorization, MutationProposal,
                     InspectionEvidenceRef, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity,
-                    ResultReview, ReviewVerdict, Task, TaskID, TaskState, TaskStateRecord,
+                    ResultReview, ReviewVerdict, Task, TaskID, TaskState, TaskStateRecord, OperationKind,
                     VerificationResult, WorkspaceIdentity)
 
 Stage = TaskState
@@ -30,6 +31,99 @@ def canonical_plan_digest(plan: Plan) -> PlanDigest:
         "verification": list(plan.verification), "exclusions": list(plan.exclusions),
     }
     return PlanDigest(hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest())
+
+
+def mutation_argument_digest(content: str) -> str:
+    if type(content) is not str:
+        raise ValueError("WRITE content must be a string")
+    payload = json.dumps({"content": content}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def canonical_mutation_proposal_digest(proposal: MutationProposal) -> str:
+    payload = {"schema": "engineering-gate.mutation-proposal", "version": 1,
+               "proposal_id": proposal.proposal_id, "task_id": str(proposal.task_id),
+               "revision": int(proposal.revision), "plan_digest": str(proposal.plan_digest),
+               "operation": {"kind": proposal.operation.kind.value, "target": proposal.operation.target,
+                             "rationale": proposal.operation.rationale},
+               "argument_digest": proposal.argument_digest, "rationale": proposal.rationale,
+               "diff_digest": proposal.diff_digest}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _parse_canonical_utc(value: str) -> datetime:
+    if type(value) is not str:
+        raise ValueError("timestamp must be canonical UTC ISO-8601")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("malformed timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed) or not value.endswith("Z") or parsed.isoformat(timespec="seconds").replace("+00:00", "Z") != value:
+        raise ValueError("timestamp must be canonical UTC ISO-8601")
+    return parsed
+
+
+def record_mutation_proposal(state: TaskStateRecord, proposal: MutationProposal) -> TaskStateRecord:
+    if type(proposal) is not MutationProposal or state.state is not TaskState.IMPLEMENTING:
+        raise TransitionError("mutation proposal requires IMPLEMENTING state and typed proposal")
+    plan_digest = canonical_plan_digest(state.plan) if state.plan is not None else None
+    receipt, request, permit = state.approval, state.approval_request, state.permit
+    if (state.plan is None or state.plan_digest != plan_digest or state.plan.workspace_identity is None
+            or state.plan_review is None or state.plan_review.verdict is not ReviewVerdict.APPROVED
+            or request is None or receipt is None or not receipt.approved
+            or (receipt.request_id, receipt.task_id, receipt.revision, receipt.digest, receipt.requester) !=
+               (request.request_id, request.task_id, request.revision, request.digest, state.task.requester)
+            or (request.task_id, request.revision, request.digest) != (state.task_id, state.revision, plan_digest)
+            or permit is None or permit.task_id != state.task_id or permit.revision != state.revision
+            or permit.digest != plan_digest or proposal.operation not in permit.scope.operations):
+        raise TransitionError("mutation proposal requires current plan review, approval, and scoped permit")
+    if (proposal.task_id != state.task_id or proposal.revision != state.revision
+            or proposal.plan_digest != plan_digest or proposal.operation not in state.plan.operations
+            or proposal.operation.kind is not OperationKind.WRITE):
+        raise TransitionError("mutation proposal does not match current approved plan")
+    previous = state.mutation_proposal
+    same = previous is not None and canonical_mutation_proposal_digest(previous) == canonical_mutation_proposal_digest(proposal)
+    return replace(state, mutation_proposal=proposal,
+                   mutation_authorization=state.mutation_authorization if same else None)
+
+
+def record_mutation_authorization(state: TaskStateRecord, authorization: MutationAuthorization, *, now=None) -> TaskStateRecord:
+    if type(authorization) is not MutationAuthorization or state.state is not TaskState.IMPLEMENTING or state.mutation_proposal is None:
+        raise TransitionError("authorization requires a current proposal in IMPLEMENTING state")
+    proposal = state.mutation_proposal
+    try:
+        plan_digest = canonical_plan_digest(state.plan) if state.plan is not None else None
+        if (state.plan is None or state.plan_digest != plan_digest or state.plan.workspace_identity is None
+                or state.plan_review is None or state.plan_review.verdict is not ReviewVerdict.APPROVED
+                or state.approval_request is None or state.approval is None or not state.approval.approved
+                or (state.approval.request_id, state.approval.task_id, state.approval.revision,
+                    state.approval.digest, state.approval.requester) !=
+                   (state.approval_request.request_id, state.approval_request.task_id,
+                    state.approval_request.revision, state.approval_request.digest, state.task.requester)
+                or (state.approval_request.task_id, state.approval_request.revision, state.approval_request.digest) !=
+                   (state.task_id, state.revision, plan_digest)
+                or state.permit is None or state.permit.task_id != state.task_id
+                or state.permit.revision != state.revision or state.permit.digest != plan_digest
+                or proposal.operation not in state.permit.scope.operations
+                or proposal.task_id != state.task_id or proposal.revision != state.revision
+                or proposal.plan_digest != plan_digest or proposal.operation not in state.plan.operations
+                or proposal.operation.kind is not OperationKind.WRITE):
+            raise TransitionError("authorization context is no longer current")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TransitionError("authorization context is malformed") from exc
+    if (authorization.task_id != state.task_id or authorization.revision != state.revision
+            or authorization.plan_digest != plan_digest
+            or authorization.proposal_digest != canonical_mutation_proposal_digest(proposal)):
+        raise TransitionError("authorization does not match current proposal and plan")
+    try:
+        instant = _parse_canonical_utc(datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if now is None else now) if isinstance(now, (str, type(None))) else now
+        start = _parse_canonical_utc(authorization.authorized_at)
+        expiry = _parse_canonical_utc(authorization.expires_at)
+    except (TypeError, ValueError) as exc:
+        raise TransitionError("authorization timestamps must be canonical UTC") from exc
+    if not isinstance(instant, datetime) or instant.tzinfo is None or instant.utcoffset() != timezone.utc.utcoffset(instant) or not start <= instant < expiry:
+        raise TransitionError("authorization is not currently valid")
+    return replace(state, mutation_authorization=authorization)
 
 
 def capture_workspace_identity(path: str) -> WorkspaceIdentity:
@@ -88,6 +182,7 @@ def revise_plan(task: TaskStateRecord, plan: Plan) -> TaskStateRecord:
     plan = _bind_workspace(plan)
     return replace(task, plan=plan, plan_digest=canonical_plan_digest(plan), revision=PlanRevision(int(task.revision) + 1),
                    plan_review=None, approval_request=None, approval=None, permit=None,
+                   mutation_proposal=None, mutation_authorization=None,
                    blast_radius=None, result_review=None, handoff=None,
                    history=task.history + (TaskState.PLAN,))
 
@@ -176,11 +271,13 @@ def transition(task: TaskStateRecord, event: Event, artifact: object | None = No
         # revoke all authorization and downstream artifacts tied to the old plan.
         updated = replace(updated, blast_radius=None, plan_review=None,
                           approval_request=None, approval=None, permit=None,
+                          mutation_proposal=None, mutation_authorization=None,
                           verification=(), handoff=None)
     if event is Event.PLAN_REVIEW_FAILED:
-        updated = replace(updated, blast_radius=None, approval_request=None, approval=None, permit=None)
+        updated = replace(updated, blast_radius=None, approval_request=None, approval=None, permit=None,
+                          mutation_proposal=None, mutation_authorization=None)
     if event is Event.IMPLEMENTATION_FIX_REQUIRED:
-        updated = replace(updated, verification=())
+        updated = replace(updated, verification=(), mutation_proposal=None, mutation_authorization=None)
     return _move(updated, next_state)
 
 
@@ -201,4 +298,6 @@ def _move(task: TaskStateRecord, state: TaskState) -> TaskStateRecord:
     return replace(task, state=state, history=task.history + (state,))
 
 
-__all__ = ["Event", "Stage", "TransitionError", "canonical_plan_digest", "new_task", "record_approval", "revise_plan", "transition"]
+__all__ = ["Event", "Stage", "TransitionError", "canonical_mutation_proposal_digest", "canonical_plan_digest",
+           "mutation_argument_digest", "new_task", "record_approval", "record_mutation_authorization",
+           "record_mutation_proposal", "revise_plan", "transition"]

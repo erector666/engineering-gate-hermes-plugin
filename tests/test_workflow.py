@@ -5,11 +5,163 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
-from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, InspectionEvidenceRef, MutationScope, NormalizedOperation, OperationKind, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity, ResultReview, ReviewVerdict, TaskState, TaskStateRecord, VerificationResult, WorkspaceIdentity)
-from engineering_gate_core.workflow import Stage, new_task, transition, Event, TransitionError, record_approval, revise_plan, canonical_plan_digest
+from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, InspectionEvidenceRef, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation, OperationKind, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity, ResultReview, ReviewVerdict, TaskState, TaskStateRecord, VerificationResult, WorkspaceIdentity)
+from engineering_gate_core.workflow import Stage, new_task, transition, Event, TransitionError, record_approval, revise_plan, canonical_plan_digest, canonical_mutation_proposal_digest, mutation_argument_digest, record_mutation_proposal, record_mutation_authorization, capture_workspace_identity
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_mutation_proposal_and_authorization_bind_to_live_implementing_plan(self):
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update output")
+        import tempfile
+        with tempfile.TemporaryDirectory() as workspace:
+            root = str(Path(workspace).resolve())
+            plan = Plan("change", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",), workspace_root=root,
+                        workspace_identity=__import__("engineering_gate_core.workflow", fromlist=["capture_workspace_identity"]).capture_workspace_identity(root))
+            digest = canonical_plan_digest(plan)
+            base = new_task("proposal-task", "change", RequesterIdentity("u"))
+            task = TaskStateRecord(base.task, TaskState.IMPLEMENTING, PlanRevision(1), (TaskState.IMPLEMENTING,),
+                                   plan=plan, plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+                                   approval_request=ApprovalRequest(base.task_id, PlanRevision(1), digest, "request"),
+                                   approval=ApprovalReceipt("request", base.task_id, PlanRevision(1), digest, base.task.requester, True),
+                                   permit=ExecutionPermit(base.task_id, PlanRevision(1), digest, MutationScope((op,))))
+            proposal = MutationProposal("p1", task.task_id, task.revision, digest, op, mutation_argument_digest("hello"), "write reviewed output")
+            recorded = record_mutation_proposal(task, proposal)
+            auth = MutationAuthorization("a1", task.task_id, task.revision, digest,
+                                         canonical_mutation_proposal_digest(proposal), "provider",
+                                         "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
+            authorized = record_mutation_authorization(recorded, auth, now="2026-10-01T10:30:00Z")
+            self.assertEqual(authorized.mutation_authorization, auth)
+            changed = MutationProposal("p2", task.task_id, task.revision, digest, op, mutation_argument_digest("different"), "write reviewed output")
+            self.assertIsNone(record_mutation_proposal(authorized, changed).mutation_authorization)
+
+    def test_mutation_proposal_rejects_unapproved_or_mismatched_plan_binding(self):
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update output")
+        plan = Plan("change", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        base = new_task("proposal-invalid", "change", RequesterIdentity("u"))
+        task = TaskStateRecord(base.task, TaskState.IMPLEMENTING, PlanRevision(1), (TaskState.IMPLEMENTING,),
+                               plan=plan, plan_digest=canonical_plan_digest(plan),
+                               plan_review=PlanReview(ReviewVerdict.APPROVED))
+        proposal = MutationProposal("p", task.task_id, task.revision, task.plan_digest, op,
+                                    mutation_argument_digest("x"), "write")
+        with self.assertRaises(TransitionError):
+            record_mutation_proposal(task, proposal)
+
+    def test_mutation_proposal_requires_current_plan_and_approval_bindings(self):
+        import tempfile
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        with tempfile.TemporaryDirectory() as workspace:
+            root = str(Path(workspace).resolve())
+            plan = Plan("change", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                        workspace_root=root, workspace_identity=capture_workspace_identity(root))
+            base = new_task("binding", "change", RequesterIdentity("u"))
+            digest = canonical_plan_digest(plan)
+            current = TaskStateRecord(base.task, TaskState.IMPLEMENTING, PlanRevision(1),
+                (TaskState.IMPLEMENTING,), plan=plan, plan_digest=digest,
+                plan_review=PlanReview(ReviewVerdict.APPROVED),
+                approval_request=ApprovalRequest(base.task_id, 1, digest, "request"),
+                approval=ApprovalReceipt("request", base.task_id, 1, digest, base.task.requester, True),
+                permit=ExecutionPermit(base.task_id, 1, digest, MutationScope((op,))))
+            proposal = MutationProposal("p", base.task_id, 1, digest, op, mutation_argument_digest("x"), "write")
+            stale_task = MutationProposal("p", "another-task", 1, digest, op, mutation_argument_digest("x"), "write")
+            stale_revision = MutationProposal("p", base.task_id, 2, digest, op, mutation_argument_digest("x"), "write")
+            stale_plan = MutationProposal("p", base.task_id, 1, PlanDigest("0" * 64), op, mutation_argument_digest("x"), "write")
+            for invalid in (
+                __import__("dataclasses").replace(current, task=__import__("dataclasses").replace(current.task, task_id="other")),
+                __import__("dataclasses").replace(current, plan_digest=PlanDigest("0" * 64)),
+                __import__("dataclasses").replace(current, approval=ApprovalReceipt("wrong", base.task_id, 1, digest, base.task.requester, True)),
+                __import__("dataclasses").replace(current, permit=ExecutionPermit(base.task_id, 1, digest, MutationScope(()))),
+                __import__("dataclasses").replace(current, plan=__import__("dataclasses").replace(plan, workspace_identity=None)),
+            ):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(TransitionError): record_mutation_proposal(invalid, proposal)
+            for invalid_proposal in (stale_task, stale_revision, stale_plan,
+                                     __import__("dataclasses").replace(proposal, operation=NormalizedOperation(OperationKind.WRITE, "other", "write"))):
+                with self.subTest(invalid_proposal=invalid_proposal):
+                    with self.assertRaises(TransitionError): record_mutation_proposal(current, invalid_proposal)
+            with self.assertRaises(ValueError):
+                __import__("dataclasses").replace(proposal,
+                    operation=NormalizedOperation(OperationKind.PATCH, "output.txt", "patch"))
+
+    def test_mutation_proposal_rejects_noncanonical_argument_digest(self):
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        base = new_task("bad-digest", "change", RequesterIdentity("u"))
+        with self.assertRaises(ValueError):
+            MutationProposal("p", base.task_id, 1, PlanDigest("0" * 64), op, "not-a-digest", "write")
+
+    def test_mutation_authorization_rejects_noncanonical_timestamp(self):
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        base = new_task("bad-time", "change", RequesterIdentity("u"))
+        with self.assertRaises(ValueError):
+            MutationAuthorization("a", base.task_id, 1, PlanDigest("0" * 64), "0" * 64,
+                                  "provider", "2026-10-01T10:00:00+00:00", "2026-10-01T11:00:00Z")
+
+    def test_mutation_argument_digest_is_exact_and_rejects_nonstring(self):
+        import hashlib
+        import json
+        value = "é\n"
+        expected = hashlib.sha256(json.dumps({"content": value}, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+        self.assertEqual(mutation_argument_digest(value), expected)
+        for invalid in (None, 3, float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                mutation_argument_digest(invalid)
+
+    def test_mutation_proposal_digest_tracks_every_bound_field(self):
+        from dataclasses import replace
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        base = new_task("proposal-digest", "change", RequesterIdentity("u"))
+        proposal = MutationProposal("p", base.task_id, 1, PlanDigest("0" * 64), op,
+                                    mutation_argument_digest("x"), "write")
+        digest = canonical_mutation_proposal_digest(proposal)
+        for changed in (replace(proposal, proposal_id="p2"), replace(proposal, operation=replace(op, rationale="other")),
+                        replace(proposal, argument_digest=mutation_argument_digest("y")),
+                        replace(proposal, rationale="different"),
+                        replace(proposal, diff_digest="1" * 64)):
+            self.assertNotEqual(digest, canonical_mutation_proposal_digest(changed))
+
+    def test_proposal_digest_is_instance_stable_and_argument_sensitive(self):
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        args = mutation_argument_digest("x")
+        first = MutationProposal("p", "task", 1, PlanDigest("0" * 64), op, args, "write")
+        second = MutationProposal("p", "task", 1, PlanDigest("0" * 64), op, args, "write")
+        changed = MutationProposal("p", "task", 1, PlanDigest("0" * 64), op,
+                                   mutation_argument_digest("y"), "write")
+        self.assertEqual(canonical_mutation_proposal_digest(first), canonical_mutation_proposal_digest(second))
+        self.assertNotEqual(canonical_mutation_proposal_digest(first), canonical_mutation_proposal_digest(changed))
+
+    def test_mutation_authorization_expiry_is_exclusive(self):
+        import tempfile
+        from dataclasses import replace
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        base = new_task("expiry", "change", RequesterIdentity("u"))
+        with tempfile.TemporaryDirectory() as workspace:
+            root = str(Path(workspace).resolve())
+            plan = Plan("change", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                        workspace_root=root, workspace_identity=capture_workspace_identity(root))
+            digest = canonical_plan_digest(plan)
+            state = TaskStateRecord(base.task, TaskState.IMPLEMENTING, 1, (TaskState.IMPLEMENTING,), plan=plan,
+                plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+                approval_request=ApprovalRequest(base.task_id, 1, digest, "r"),
+                approval=ApprovalReceipt("r", base.task_id, 1, digest, base.task.requester, True),
+                permit=ExecutionPermit(base.task_id, 1, digest, MutationScope((op,))))
+            proposal = MutationProposal("p", base.task_id, 1, digest, op, mutation_argument_digest("x"), "write")
+            state = record_mutation_proposal(state, proposal)
+            auth = MutationAuthorization("a", base.task_id, 1, digest, canonical_mutation_proposal_digest(proposal),
+                                         "provider", "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
+            with self.assertRaises(TransitionError):
+                record_mutation_authorization(state, auth, now="2026-10-01T11:00:00Z")
+            with self.assertRaises(TransitionError):
+                record_mutation_authorization(replace(state, approval_request=None), auth, now="2026-10-01T10:30:00Z")
+            for invalid_auth in (
+                replace(auth, task_id="other"), replace(auth, revision=2),
+                replace(auth, plan_digest=PlanDigest("0" * 64)),
+                replace(auth, proposal_digest="0" * 64),
+                replace(auth, expires_at="2026-10-01T10:30:00Z"),
+                replace(auth, authorized_at="2026-10-01T10:31:00Z"),
+            ):
+                with self.subTest(invalid_auth=invalid_auth), self.assertRaises(TransitionError):
+                    record_mutation_authorization(state, invalid_auth, now="2026-10-01T10:30:00Z")
+
     def test_new_task_records_intake_and_enters_inspection(self):
         task = new_task("task-1", "Add a feature", RequesterIdentity("user-1"))
         self.assertEqual(task.state, Stage.INSPECT)
@@ -237,6 +389,45 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(revised.approval_request)
         self.assertIsNone(revised.approval)
         self.assertIsNone(revised.permit)
+
+    def test_proposal_and_authorization_are_cleared_by_all_plan_and_fix_invalidations(self):
+        import tempfile
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        with tempfile.TemporaryDirectory() as workspace:
+            root = str(Path(workspace).resolve())
+            plan = Plan("x", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                        workspace_root=root, workspace_identity=capture_workspace_identity(root))
+            digest = canonical_plan_digest(plan)
+            base = new_task("invalidate", "x", RequesterIdentity("u"))
+            proposal = MutationProposal("p", base.task_id, 1, digest, op, mutation_argument_digest("x"), "write")
+            auth = MutationAuthorization("a", base.task_id, 1, digest, canonical_mutation_proposal_digest(proposal),
+                "provider", "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
+            common = dict(plan=plan, plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+                approval_request=ApprovalRequest(base.task_id, 1, digest, "r"),
+                approval=ApprovalReceipt("r", base.task_id, 1, digest, base.task.requester, True),
+                permit=ExecutionPermit(base.task_id, 1, digest, MutationScope((op,))),
+                mutation_proposal=proposal, mutation_authorization=auth)
+            plan_state = TaskStateRecord(base.task, TaskState.PLAN, 1, (TaskState.PLAN,), **common)
+            new_plan = Plan("x2", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                workspace_root=root, workspace_identity=capture_workspace_identity(root))
+            revised = revise_plan(plan_state, new_plan)
+            self.assertIsNone(revised.mutation_proposal)
+            self.assertIsNone(revised.mutation_authorization)
+            checks = (
+                (TaskStateRecord(base.task, TaskState.VERIFYING, 1, (TaskState.VERIFYING,), **common,
+                    verification=(VerificationResult("c", (Evidence("e", "failed", False),), False),)),
+                 Event.REPLAN_REQUIRED, ResultReview(ReviewVerdict.REPLAN)),
+                (TaskStateRecord(base.task, TaskState.PLAN_REVIEW, 1, (TaskState.PLAN_REVIEW,), **common),
+                 Event.PLAN_REVIEW_FAILED, PlanReview(ReviewVerdict.NEEDS_CHANGES)),
+                (TaskStateRecord(base.task, TaskState.VERIFYING, 1, (TaskState.VERIFYING,), **common,
+                    verification=(VerificationResult("c", (Evidence("e", "failed", False),), False),)),
+                 Event.IMPLEMENTATION_FIX_REQUIRED, ResultReview(ReviewVerdict.IMPLEMENT_FIX)),
+            )
+            for state, event, payload in checks:
+                updated = transition(state, event, payload)
+                with self.subTest(event=event):
+                    self.assertIsNone(updated.mutation_proposal)
+                    self.assertIsNone(updated.mutation_authorization)
 
     def test_verification_requires_all_criteria_at_stage_entry(self):
         plan = Plan("x", (NormalizedOperation(OperationKind.READ, "a"),),
