@@ -9,9 +9,9 @@ sys.path.insert(0, str(ROOT / "engineering-gate"))
 from engineering_gate_core.models import (
     AcceptanceCriterion, ApprovalReceipt, ExecutionPermit, MutationScope,
     NormalizedOperation, OperationKind, Plan, PlanDigest, PlanRevision,
-    RequesterIdentity, TaskState, TaskStateRecord,
+    RequesterIdentity, TaskState, TaskStateRecord, WorkspaceIdentity,
 )
-from engineering_gate_core.workflow import canonical_plan_digest
+from engineering_gate_core.workflow import canonical_plan_digest, capture_workspace_identity
 from engineering_gate_core.policy import PolicyAction, authorize_invocation
 
 
@@ -21,7 +21,8 @@ class PolicyTests(unittest.TestCase):
         self.workspace_root = str(Path(self._workspace.name).resolve())
         self.requester = RequesterIdentity("alice")
         self.op = NormalizedOperation(OperationKind.WRITE, "src/file.py", "update")
-        self.plan = Plan("change", (self.op,), (AcceptanceCriterion("a", "works", "test"),), ("run tests",), workspace_root=self.workspace_root)
+        self.plan = Plan("change", (self.op,), (AcceptanceCriterion("a", "works", "test"),), ("run tests",), workspace_root=self.workspace_root,
+                         workspace_identity=capture_workspace_identity(self.workspace_root))
         digest = canonical_plan_digest(self.plan)
         self.state = TaskStateRecord(
             task=__import__("engineering_gate_core.models", fromlist=["Task"]).Task("task-1", "change", self.requester),
@@ -63,9 +64,10 @@ class PolicyTests(unittest.TestCase):
     def test_planned_but_out_of_scope_operation_reports_scope_drift(self):
         from dataclasses import replace
         other = NormalizedOperation(OperationKind.WRITE, "src/other.py", "other")
-        plan = Plan("change", (self.op, other), self.plan.acceptance_criteria, self.plan.verification, workspace_root=self.workspace_root)
+        plan = Plan("change", (self.op, other), self.plan.acceptance_criteria, self.plan.verification, workspace_root=self.workspace_root,
+                    workspace_identity=self.plan.workspace_identity)
         from engineering_gate_core.models import ExecutionPermit, MutationScope
-        from engineering_gate_core.workflow import canonical_plan_digest
+        from engineering_gate_core.workflow import canonical_plan_digest, capture_workspace_identity
         digest = canonical_plan_digest(plan)
         state = replace(self.state, plan=plan, plan_digest=digest,
                         approval=replace(self.state.approval, digest=digest),
@@ -76,7 +78,7 @@ class PolicyTests(unittest.TestCase):
         for target in ("/etc/passwd", "../outside", "src/../outside", "C:\\\\outside", f"src{chr(92)}file.py", "."):
             op = NormalizedOperation(OperationKind.WRITE, target, "bad")
             state = __import__("dataclasses").replace(
-                self.state, plan=Plan(self.plan.objective, (op,), self.plan.acceptance_criteria, self.plan.verification, workspace_root=self.workspace_root),
+                self.state, plan=Plan(self.plan.objective, (op,), self.plan.acceptance_criteria, self.plan.verification, workspace_root=self.workspace_root, workspace_identity=self.plan.workspace_identity),
                 plan_digest=None)
             from engineering_gate_core.workflow import canonical_plan_digest
             digest = canonical_plan_digest(state.plan)
@@ -93,7 +95,8 @@ class PolicyTests(unittest.TestCase):
             Path(root, "escape").symlink_to(outside, target_is_directory=True)
             op = NormalizedOperation(OperationKind.WRITE, "escape/file", "bad")
             plan = Plan(self.plan.objective, (op,), self.plan.acceptance_criteria, self.plan.verification,
-                        workspace_root=str(Path(root).resolve()))
+                        workspace_root=str(Path(root).resolve()),
+                        workspace_identity=capture_workspace_identity(str(Path(root).resolve())))
             from engineering_gate_core.workflow import canonical_plan_digest
             digest = canonical_plan_digest(plan)
             state = replace(self.state, plan=plan, plan_digest=digest,
@@ -107,13 +110,14 @@ class PolicyTests(unittest.TestCase):
     def test_rejects_symlink_alias_inside_workspace(self):
         from dataclasses import replace
         from engineering_gate_core.models import MutationScope
-        from engineering_gate_core.workflow import canonical_plan_digest
+        from engineering_gate_core.workflow import canonical_plan_digest, capture_workspace_identity
         with tempfile.TemporaryDirectory() as root:
             Path(root, "src", "real").mkdir(parents=True)
             Path(root, "src", "alias").symlink_to(Path(root, "src", "real"), target_is_directory=True)
             op = NormalizedOperation(OperationKind.WRITE, "src/alias/file.py", "redirect")
             plan = Plan(self.plan.objective, (op,), self.plan.acceptance_criteria, self.plan.verification,
-                        workspace_root=str(Path(root).resolve()))
+                        workspace_root=str(Path(root).resolve()),
+                        workspace_identity=capture_workspace_identity(str(Path(root).resolve())))
             digest = canonical_plan_digest(plan)
             state = replace(self.state, plan=plan, plan_digest=digest,
                 approval=replace(self.state.approval, digest=digest),
@@ -137,6 +141,20 @@ class PolicyTests(unittest.TestCase):
             left = replace(self.plan, workspace_root=str(Path(first).resolve()))
             right = replace(self.plan, workspace_root=str(Path(second).resolve()))
             self.assertNotEqual(canonical_plan_digest(left), canonical_plan_digest(right))
+
+    def test_plan_digest_binds_workspace_identity_and_policy_rejects_mismatch(self):
+        from dataclasses import replace
+        identity = self.plan.workspace_identity
+        forged_plan = replace(self.plan, workspace_identity=WorkspaceIdentity(
+            identity.canonical_path, identity.device, identity.inode + 1))
+        digest = canonical_plan_digest(forged_plan)
+        state = replace(self.state, plan=forged_plan, plan_digest=digest,
+                        approval=replace(self.state.approval, digest=digest),
+                        permit=replace(self.state.permit, digest=digest))
+        self.assertNotEqual(digest, canonical_plan_digest(self.plan))
+        decision = authorize_invocation(state, self.op, self.workspace_root)
+        self.assertEqual(decision.action, PolicyAction.BLOCK)
+        self.assertIn("identity", decision.reason)
 
     def test_blocks_caller_supplied_alternate_workspace(self):
         from dataclasses import replace

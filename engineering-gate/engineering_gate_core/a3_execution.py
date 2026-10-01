@@ -15,6 +15,7 @@ from threading import Lock
 from typing import Any, Callable
 
 from .models import NormalizedOperation, OperationKind, TaskStateRecord
+from .models import WorkspaceIdentity
 from .policy import PolicyAction, authorize_invocation
 
 
@@ -25,6 +26,10 @@ class MutationOutcomeUnknown(RuntimeError):
     does not roll back or reconcile the filesystem mutation; inspect the target
     before retrying.
     """
+
+
+class WorkspacePathDetached(RuntimeError):
+    """The pinned workspace received the write, but its canonical path changed."""
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,11 @@ class _Binding:
     operation: NormalizedOperation
     target: str
     argument_digest: str
+
+
+@dataclass(frozen=True)
+class _DetachedOutcome:
+    cause: BaseException
 
 
 def _digest(arguments: Any) -> str:
@@ -88,6 +98,11 @@ class GateWriteService:
     def _authorize(self, state: TaskStateRecord, operation: NormalizedOperation) -> str:
         if not isinstance(operation, NormalizedOperation) or operation.kind is not OperationKind.WRITE:
             raise PermissionError("unsupported operation")
+        target = operation.target
+        if (not isinstance(target, str) or not target or target in (".", "..")
+                or "/" in target or "\\" in target or "\x00" in target
+                or Path(target).is_absolute()):
+            raise PermissionError("write target must be one root-level filename")
         decision = authorize_invocation(state, operation, self._root)
         if decision.action is not PolicyAction.ALLOW:
             raise PermissionError(f"invocation is not authorized: {decision.reason}")
@@ -138,12 +153,14 @@ class GateWriteService:
         if task_id != binding.task_id:
             raise PermissionError("request does not match permit")
         replacement_completed = False
+        approved_identity: WorkspaceIdentity | None = None
 
         def execute_current(state: TaskStateRecord) -> Path:
-            nonlocal replacement_completed
+            nonlocal replacement_completed, approved_identity
             if not isinstance(state, TaskStateRecord) or state.task_id != task_id:
                 raise PermissionError("current task state is invalid or belongs to another task")
             plan_digest = self._authorize(state, operation)
+            approved_identity = state.plan.workspace_identity if state.plan else None
             try:
                 arg_digest = _digest(arguments)
             except (TypeError, ValueError) as exc:
@@ -156,23 +173,13 @@ class GateWriteService:
                 raise ValueError("write arguments must contain only string content")
 
             relative = Path(operation.target)
-            if relative.is_absolute() or not relative.parts or any(part in (".", "..") for part in relative.parts):
-                raise PermissionError("target must be a contained relative path")
             required = ("O_DIRECTORY", "O_NOFOLLOW", "supports_dir_fd")
             if not all(hasattr(os, name) for name in required) or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd or os.rename not in os.supports_dir_fd:
                 raise PermissionError("platform lacks safe descriptor-relative filesystem operations")
             directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            descriptors: list[int] = []
             temp_name: str | None = None
             parent_fd = os.dup(self._root_fd)
-            descriptors.append(parent_fd)
             try:
-                for part in relative.parts[:-1]:
-                    try:
-                        parent_fd = os.open(part, directory_flags, dir_fd=parent_fd)
-                    except OSError as exc:
-                        raise PermissionError("target parent is missing or traverses a symlink") from exc
-                    descriptors.append(parent_fd)
                 name = relative.parts[-1]
                 try:
                     existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -183,6 +190,8 @@ class GateWriteService:
                 if existing is not None and not stat.S_ISREG(existing.st_mode):
                     raise PermissionError("target must be a regular file, not a symlink or special file")
                 temp_name = f".gate-write-{secrets.token_hex(16)}.tmp"
+                while temp_name == name:
+                    temp_name = f".gate-write-{secrets.token_hex(16)}.tmp"
                 fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent_fd)
                 try:
                     if existing is not None:
@@ -195,24 +204,51 @@ class GateWriteService:
                         view = view[written:]
                 finally:
                     os.close(fd)
+                self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
                 os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 replacement_completed = True
                 temp_name = None
+                try:
+                    self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
+                except PermissionError as exc:
+                    return _DetachedOutcome(exc)
             finally:
                 if temp_name is not None:
                     try:
                         os.unlink(temp_name, dir_fd=parent_fd)
                     except FileNotFoundError:
                         pass
-                for descriptor in reversed(descriptors):
-                    os.close(descriptor)
+                os.close(parent_fd)
             return self._root.joinpath(relative)
 
         try:
-            return self._state_transaction(task_id, execute_current)
+            outcome = self._state_transaction(task_id, execute_current)
         except Exception as exc:
             if replacement_completed:
                 raise MutationOutcomeUnknown(
                     "the write may have completed; inspect the target before retrying"
                 ) from exc
             raise
+        if isinstance(outcome, _DetachedOutcome):
+            raise WorkspacePathDetached(
+                "write completed on the pinned approved workspace inode, but the approved workspace path changed; no path result is available"
+            ) from outcome.cause
+        try:
+            self._validate_workspace_identity(approved_identity)
+        except PermissionError as exc:
+            raise WorkspacePathDetached(
+                "write completed on the pinned approved workspace inode, but the approved workspace path changed; no path result is available"
+            ) from exc
+        return outcome
+
+    def _validate_workspace_identity(self, identity: WorkspaceIdentity | None) -> None:
+        try:
+            pinned = os.fstat(self._root_fd)
+            path_info = self._root.lstat()
+            if (identity is None or self._root.is_symlink() or not stat.S_ISDIR(path_info.st_mode)
+                    or str(self._root) != identity.canonical_path
+                    or (pinned.st_dev, pinned.st_ino) != (identity.device, identity.inode)
+                    or (path_info.st_dev, path_info.st_ino) != (identity.device, identity.inode)):
+                raise PermissionError("approved workspace identity changed")
+        except OSError as exc:
+            raise PermissionError("approved workspace identity is unavailable") from exc

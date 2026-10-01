@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
-from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, InspectionEvidenceRef, MutationScope, NormalizedOperation, OperationKind, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity, ResultReview, ReviewVerdict, TaskState, TaskStateRecord, VerificationResult)
+from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff, InspectionEvidenceRef, MutationScope, NormalizedOperation, OperationKind, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity, ResultReview, ReviewVerdict, TaskState, TaskStateRecord, VerificationResult, WorkspaceIdentity)
 from engineering_gate_core.workflow import Stage, new_task, transition, Event, TransitionError, record_approval, revise_plan, canonical_plan_digest
 
 
@@ -81,6 +81,24 @@ class WorkflowTests(unittest.TestCase):
         result = transition(task, Event.PLAN_RECORDED, plan)
         self.assertEqual(result.revision, 1)
         self.assertEqual(result.plan_digest, canonical_plan_digest(plan))
+
+    def test_plan_recording_captures_identity_instead_of_trusting_supplied_numbers(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as workspace:
+            root = str(Path(workspace).resolve())
+            task = new_task("identity", "Feature", RequesterIdentity("u"))
+            task = TaskStateRecord(task.task, TaskState.PLAN, task.revision,
+                                   task.history + (TaskState.ANALYZE, TaskState.PLAN),
+                                   inspection=InspectionEvidenceRef("inspect-1", "baseline"))
+            plan = Plan("Feature", (NormalizedOperation(OperationKind.WRITE, "a"),),
+                        (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                        workspace_root=root,
+                        workspace_identity=WorkspaceIdentity(root, -1, -1))
+            recorded = transition(task, Event.PLAN_RECORDED, plan)
+            actual = Path(root).stat()
+            self.assertEqual(recorded.plan.workspace_identity,
+                             WorkspaceIdentity(root, actual.st_dev, actual.st_ino))
+            self.assertEqual(recorded.plan_digest, canonical_plan_digest(recorded.plan))
 
     def test_plan_recording_requires_nonempty_inspection_reference(self):
         task = new_task("first", "Feature", RequesterIdentity("u"))

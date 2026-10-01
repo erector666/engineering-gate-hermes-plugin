@@ -102,6 +102,9 @@ def authorize_invocation(state: TaskStateRecord, operation: NormalizedOperation,
         return block("current plan digest is invalid")
     if not isinstance(state.plan.workspace_root, str) or not state.plan.workspace_root:
         return block("approved plan has no workspace root")
+    identity = state.plan.workspace_identity
+    if identity is None:
+        return block("approved plan has no captured workspace identity")
     try:
         approved_root = Path(state.plan.workspace_root)
         supplied_root = Path(workspace_root)
@@ -109,6 +112,11 @@ def authorize_invocation(state: TaskStateRecord, operation: NormalizedOperation,
             return block("approved workspace root is invalid or non-canonical")
         if supplied_root.resolve(strict=True) != approved_root or not approved_root.is_dir():
             return block("caller workspace does not match the approved plan")
+        info = approved_root.lstat()
+        if approved_root.is_symlink() or (str(approved_root), info.st_dev, info.st_ino) != (
+            identity.canonical_path, identity.device, identity.inode
+        ):
+            return block("approved workspace identity does not match the filesystem")
     except (OSError, RuntimeError, ValueError, TypeError):
         return block("approved or caller workspace root is invalid")
     approval, permit = state.approval, state.permit

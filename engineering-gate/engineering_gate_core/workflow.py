@@ -3,11 +3,14 @@ from dataclasses import replace
 from enum import Enum
 import hashlib
 import json
+import os
+import stat
+from pathlib import Path
 
 from .models import (ApprovalReceipt, ApprovalRequest, Evidence, ExecutionPermit, Handoff,
                     InspectionEvidenceRef, Plan, PlanDigest, PlanReview, PlanRevision, RequesterIdentity,
                     ResultReview, ReviewVerdict, Task, TaskID, TaskState, TaskStateRecord,
-                    VerificationResult)
+                    VerificationResult, WorkspaceIdentity)
 
 Stage = TaskState
 
@@ -16,12 +19,36 @@ def canonical_plan_digest(plan: Plan) -> PlanDigest:
     payload = {
         "objective": plan.objective,
         "workspace_root": plan.workspace_root,
+        "workspace_identity": None if plan.workspace_identity is None else {
+            "canonical_path": plan.workspace_identity.canonical_path,
+            "device": plan.workspace_identity.device,
+            "inode": plan.workspace_identity.inode,
+        },
         "operations": [{"kind": op.kind.value, "target": op.target, "rationale": op.rationale} for op in plan.operations],
         "acceptance_criteria": [{"criterion_id": c.criterion_id, "description": c.description,
                                  "verification_procedure": c.verification_procedure} for c in plan.acceptance_criteria],
         "verification": list(plan.verification), "exclusions": list(plan.exclusions),
     }
     return PlanDigest(hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest())
+
+
+def capture_workspace_identity(path: str) -> WorkspaceIdentity:
+    if os.name != "posix":
+        raise TransitionError("stable workspace identity is unavailable on this platform")
+    candidate = Path(path)
+    if not candidate.is_absolute() or candidate.resolve(strict=True) != candidate:
+        raise TransitionError("workspace root must be canonical and absolute")
+    info = candidate.lstat()
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or type(info.st_dev) is not int or type(info.st_ino) is not int):
+        raise TransitionError("workspace root has no stable directory identity")
+    return WorkspaceIdentity(str(candidate), info.st_dev, info.st_ino)
+
+
+def _bind_workspace(plan: Plan) -> Plan:
+    if plan.workspace_root:
+        return replace(plan, workspace_identity=capture_workspace_identity(plan.workspace_root))
+    return replace(plan, workspace_identity=None)
 
 
 class Event(str, Enum):
@@ -58,6 +85,7 @@ def new_task(task_id: str | TaskID, objective: str, requester: RequesterIdentity
 def revise_plan(task: TaskStateRecord, plan: Plan) -> TaskStateRecord:
     if task.state is not TaskState.PLAN or not isinstance(plan, Plan) or task.plan is None:
         raise TransitionError("plan edit is only legal in PLAN when an existing plan is present")
+    plan = _bind_workspace(plan)
     return replace(task, plan=plan, plan_digest=canonical_plan_digest(plan), revision=PlanRevision(int(task.revision) + 1),
                    plan_review=None, approval_request=None, approval=None, permit=None,
                    blast_radius=None, result_review=None, handoff=None,
@@ -103,6 +131,7 @@ def transition(task: TaskStateRecord, event: Event, artifact: object | None = No
     if field_name == "plan" and not (artifact.operations and artifact.acceptance_criteria and artifact.verification):
         raise TransitionError("plan requires operations, acceptance criteria, and verification")
     if field_name == "plan":
+        artifact = _bind_workspace(artifact)
         if task.plan is not None:
             raise TransitionError("an existing plan must be edited with revise_plan")
         updated_revision = PlanRevision(int(task.revision) + 1)

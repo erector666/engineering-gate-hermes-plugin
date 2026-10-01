@@ -40,6 +40,13 @@ class Task:
 
 
 @dataclass(frozen=True)
+class WorkspaceIdentity:
+    canonical_path: str
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class Plan:
     objective: str
     operations: tuple["NormalizedOperation", ...]
@@ -47,6 +54,7 @@ class Plan:
     verification: tuple[str, ...]
     exclusions: tuple[str, ...] = ()
     workspace_root: str = ""
+    workspace_identity: WorkspaceIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -190,5 +198,5 @@ __all__ = [
     "MutationScope", "NormalizedOperation", "OperationKind", "Plan", "PlanDigest",
     "PlanReview", "PlanRevision", "RequesterIdentity", "ResultReview",
     "ReviewVerdict", "Task", "TaskID", "TaskState", "TaskStateRecord",
-    "VerificationResult",
+    "VerificationResult", "WorkspaceIdentity",
 ]
