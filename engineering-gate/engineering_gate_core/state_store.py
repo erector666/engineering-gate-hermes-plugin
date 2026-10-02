@@ -223,7 +223,11 @@ def _record_from_json(text, *, allow_legacy_missing=False):
 
 
 class StateStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, timing_policy=None):
+        from .authorization_policy import AUTHORIZATION_TIMING_V1, AuthorizationTimingPolicy
+        self._timing_policy = AUTHORIZATION_TIMING_V1 if timing_policy is None else timing_policy
+        if type(self._timing_policy) is not AuthorizationTimingPolicy:
+            raise ValueError("AuthorizationTimingPolicy is required")
         self.path = Path(os.path.abspath(Path(path)))
         _ensure_private_parent(self.path.parent)
         _prepare_database(self.path)
@@ -246,6 +250,10 @@ class StateStore:
             raise
         finally:
             connection.close()
+
+    @property
+    def timing_policy(self):
+        return self._timing_policy
 
     @staticmethod
     def _utc_stamp(value):
@@ -736,8 +744,8 @@ class StateStore:
             connection.execute("INSERT INTO metadata(key,value) VALUES('authorization_clock_high_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
             if approved:
                 assert issued_at is not None and expires_at is not None
-                if (issued_at > now_dt or expires_at - issued_at > timedelta(seconds=300)
-                        or issued_at - verified.reviewed_at > timedelta(seconds=300)
+                if (issued_at > now_dt or expires_at - issued_at > timedelta(seconds=self.timing_policy.max_active_lease_seconds)
+                        or issued_at - verified.reviewed_at > timedelta(seconds=self.timing_policy.max_review_age_seconds)
                         or verified.reviewed_at > issued_at):
                     raise StateStoreError("authorization issue/expiry window is invalid")
             connection.execute("INSERT INTO signed_verdicts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
@@ -746,7 +754,7 @@ class StateStore:
                 verified.plan_revision, verified.plan_digest, verified.proposal_digest, reviewed_text, now))
             lease = None
             if approved:
-                if issued_at <= datetime.now(timezone.utc) - __import__('datetime').timedelta(seconds=300) or expires_at <= issued_at:
+                if issued_at <= datetime.now(timezone.utc) - timedelta(seconds=self.timing_policy.max_active_lease_seconds) or expires_at <= issued_at:
                     raise StateStoreError("authorization issue/expiry window is invalid")
                 connection.execute("INSERT INTO mutation_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE',NULL,?)", (
                     authorization_id, verified.review_id, str(task_id), verified.plan_revision, verified.plan_digest,
@@ -813,6 +821,9 @@ class StateStore:
             connection.execute("INSERT INTO metadata(key,value) VALUES('authorization_clock_high_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now_text,))
             row = connection.execute("SELECT * FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone()
             lease = self._lease_from_row(row)
+            if (lease.expires_at <= lease.issued_at
+                    or lease.expires_at - lease.issued_at > timedelta(seconds=self.timing_policy.max_active_lease_seconds)):
+                raise StateStoreError("stored authorization lease exceeds configured timing policy")
             if lease.status is models.AuthorizationLeaseStatus.ACTIVE and now_text >= self._utc_stamp(lease.expires_at):
                 connection.execute("UPDATE mutation_leases SET status='EXPIRED' WHERE authorization_id=? AND status='ACTIVE'", (authorization_id,))
                 self._append_authorization_event(connection, "EXPIRED", authorization_id, lease.key_id, "authorization expired before reservation", now_text)
@@ -828,7 +839,7 @@ class StateStore:
             try:
                 verified_signature = verify_signed_verdict(SignedMutationVerdict(bytes(verdict_row[0]), bytes(verdict_row[1])),
                     ReviewerPublicKey(lease.key_id, key[0], key[1], bytes(key[2]), bool(key[3]), bool(key[4])),
-                    now=now, implementer_id=lease.implementer_id, max_review_age_seconds=300)
+                    now=now, implementer_id=lease.implementer_id, timing_policy=self.timing_policy)
                 if (verified_signature.review_id != lease.review_id or verified_signature.task_id != lease.task_id
                         or verified_signature.plan_revision != lease.plan_revision
                         or verified_signature.plan_digest != lease.plan_digest

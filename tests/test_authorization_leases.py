@@ -8,11 +8,145 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
 from engineering_gate_core.models import AuthorizationLeaseStatus, MutationLeaseRecord
-from engineering_gate_core.signed_authorization import ReviewerPublicKey, VerifiedReviewerVerdict
-from engineering_gate_core.state_store import StateStore
+from engineering_gate_core.signed_authorization import ReviewerPublicKey, SignatureVerificationError, VerifiedReviewerVerdict
+from engineering_gate_core.state_store import StateStore, StateStoreError
 
 
 class AuthorizationLeaseTests(unittest.TestCase):
+    def test_shorter_policy_applies_to_issuance_verification_and_later_reservation(self):
+        from engineering_gate_core.authorization_policy import AuthorizationTimingPolicy
+        from engineering_gate_core.signed_authorization import verify_signed_verdict
+        policy = AuthorizationTimingPolicy(max_review_age_seconds=10, max_active_lease_seconds=20)
+        store = StateStore(self.path, timing_policy=policy)
+        self.assertIs(store.timing_policy, policy)
+        self.registry = __import__("engineering_gate_core.mutation_authority", fromlist=["ReviewerKeyRegistry"]).ReviewerKeyRegistry(store)
+        self.registry.register_reviewer_key(self.key)
+        verified, encoded, signature, issued = self.verdict()
+        from engineering_gate_core.signed_authorization import SignedMutationVerdict
+        with self.assertRaises(SignatureVerificationError):
+            verify_signed_verdict(SignedMutationVerdict(encoded, signature), self.key,
+                now=issued + timedelta(seconds=11), implementer_id="implementer", timing_policy=policy)
+        with self.assertRaises(StateStoreError):
+            store._record_verified_verdict("task-1", verified, encoded, signature,
+                authorization_id="too-long", issued_at=issued, expires_at=issued + timedelta(seconds=21))
+        store._record_verified_verdict("task-1", verified, encoded, signature, authorization_id="auth-short",
+            issued_at=issued, expires_at=issued + timedelta(seconds=20))
+        with self.assertRaises(StateStoreError):
+            store.reserve_mutation_lease("task-1", "auth-short", "b" * 64, issued + timedelta(seconds=11))
+
+    def test_authority_issues_expiry_from_shorter_lease_policy(self):
+        from dataclasses import replace
+        from engineering_gate_core.authorization_policy import AuthorizationTimingPolicy
+        from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
+            ExecutionPermit, MutationProposal, MutationScope, NormalizedOperation, OperationKind,
+            Plan, PlanReview, PlanRevision, RequesterIdentity, ReviewVerdict, Task, TaskState, TaskStateRecord)
+        from engineering_gate_core.mutation_authority import GateMutationAuthority
+        from engineering_gate_core.workflow import (canonical_plan_digest, canonical_mutation_proposal_digest,
+            mutation_argument_digest, capture_workspace_identity)
+        from engineering_gate_core.state_store import _record_json
+        from engineering_gate_core.signed_authorization import DOMAIN_PREFIX, SignedMutationVerdict, canonical_signed_verdict
+        policy = AuthorizationTimingPolicy(max_review_age_seconds=10, max_active_lease_seconds=20)
+        store = StateStore(self.path, timing_policy=policy)
+        self.registry = __import__("engineering_gate_core.mutation_authority", fromlist=["ReviewerKeyRegistry"]).ReviewerKeyRegistry(store)
+        self.registry.register_reviewer_key(self.key)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "write")
+        with tempfile.TemporaryDirectory() as workspace:
+            plan = Plan("change", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                        workspace_root=str(Path(workspace).resolve()))
+            plan = replace(plan, workspace_identity=capture_workspace_identity(plan.workspace_root))
+            digest = canonical_plan_digest(plan)
+            requester = RequesterIdentity("requester")
+            task = Task("task-1", "change", requester)
+            proposal = MutationProposal("proposal", "task-1", 1, digest, op, mutation_argument_digest("x"), "reviewed")
+            state = TaskStateRecord(task, TaskState.IMPLEMENTING, PlanRevision(1), (TaskState.IMPLEMENTING,),
+                plan=plan, plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+                approval_request=ApprovalRequest("task-1", 1, digest, "request"),
+                approval=ApprovalReceipt("request", "task-1", 1, digest, requester, True),
+                permit=ExecutionPermit("task-1", 1, digest, MutationScope((op,))), mutation_proposal=proposal)
+            store.create(__import__("engineering_gate_core.workflow", fromlist=["new_task"]).new_task("task-1", "change", requester))
+            connection = store._connect()
+            connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(state), "task-1"))
+            connection.commit()
+            connection.close()
+            authority = GateMutationAuthority(store, implementer_id="implementer")
+            authority._now = lambda: now
+            payload = {"schema_version": 1, "signature_algorithm": "Ed25519", "key_id": "key-1",
+                "review_id": "short-policy", "reviewer_id": "reviewer", "reviewer_provider": "provider",
+                "implementer_id": "implementer", "task_id": "task-1", "plan_revision": 1,
+                "plan_digest": digest, "proposal_digest": canonical_mutation_proposal_digest(proposal),
+                "verdict": "approve", "reviewed_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            encoded = canonical_signed_verdict(payload)
+            signed = SignedMutationVerdict(encoded, self.private_key.sign(DOMAIN_PREFIX + encoded))
+            lease = authority.record_signed_verdict("task-1", signed)
+            self.assertEqual(lease.issued_at, now)
+            self.assertEqual(lease.expires_at, now + timedelta(seconds=20))
+
+    def test_shorter_policy_rejects_extended_lease_at_reservation(self):
+        from engineering_gate_core.authorization_policy import AUTHORIZATION_TIMING_V1, AuthorizationTimingPolicy
+        policy = AuthorizationTimingPolicy(max_review_age_seconds=30, max_active_lease_seconds=10)
+        store = StateStore(self.path, timing_policy=policy)
+        with self.assertRaises(AttributeError):
+            store.timing_policy = AUTHORIZATION_TIMING_V1
+        self.assertIs(store.timing_policy, policy)
+        self.registry = __import__("engineering_gate_core.mutation_authority", fromlist=["ReviewerKeyRegistry"]).ReviewerKeyRegistry(store)
+        self.registry.register_reviewer_key(self.key)
+        verified, payload, signature, issued = self.verdict()
+        store._record_verified_verdict("task-1", verified, payload, signature,
+            authorization_id="auth-short", issued_at=issued, expires_at=issued + timedelta(seconds=10))
+        connection = store._connect()
+        connection.execute("UPDATE mutation_leases SET expires_at=? WHERE authorization_id=?",
+            ((issued + timedelta(seconds=11)).strftime("%Y-%m-%dT%H:%M:%SZ"), "auth-short"))
+        connection.commit()
+        connection.close()
+        with self.assertRaises(StateStoreError):
+            store.reserve_mutation_lease("task-1", "auth-short", "b" * 64, issued)
+
+    def test_timing_policy_cannot_exceed_v1_ceilings(self):
+        from engineering_gate_core.authorization_policy import AuthorizationTimingPolicy
+        with self.assertRaises(ValueError):
+            AuthorizationTimingPolicy(max_review_age_seconds=301, max_active_lease_seconds=300)
+        with self.assertRaises(ValueError):
+            AuthorizationTimingPolicy(max_review_age_seconds=300, max_active_lease_seconds=301)
+
+    def test_issue_persistence_uses_lease_limit_not_review_limit(self):
+        from engineering_gate_core.authorization_policy import AuthorizationTimingPolicy
+        from engineering_gate_core.signed_authorization import (
+            DOMAIN_PREFIX, SignedMutationVerdict, canonical_signed_verdict, verify_signed_verdict,
+        )
+        policy = AuthorizationTimingPolicy(max_review_age_seconds=1, max_active_lease_seconds=30)
+        store = StateStore(self.path, timing_policy=policy)
+        self.registry.register_reviewer_key(self.key)
+        issued = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=5)
+        payload = {
+            "schema_version": 1, "signature_algorithm": "Ed25519", "key_id": "key-1",
+            "review_id": "review-issue-window", "reviewer_id": "reviewer", "reviewer_provider": "provider",
+            "implementer_id": "implementer", "task_id": "task-1", "plan_revision": 1,
+            "plan_digest": "a" * 64, "proposal_digest": "b" * 64, "verdict": "approve",
+            "reviewed_at": issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        encoded = canonical_signed_verdict(payload)
+        signed = SignedMutationVerdict(encoded, self.private_key.sign(DOMAIN_PREFIX + encoded))
+        verified = verify_signed_verdict(signed, self.key, now=issued,
+            implementer_id="implementer", timing_policy=policy)
+
+        lease = store._record_verified_verdict("task-1", verified, encoded, signed.signature,
+            authorization_id="auth-issue-window", issued_at=issued, expires_at=issued + timedelta(seconds=30))
+
+        self.assertEqual(lease.expires_at, issued + timedelta(seconds=30))
+
+    def test_zero_review_age_remains_a_valid_stricter_policy(self):
+        from engineering_gate_core.authorization_policy import AuthorizationTimingPolicy
+        policy = AuthorizationTimingPolicy(max_review_age_seconds=0, max_active_lease_seconds=1)
+        self.assertEqual(policy.max_review_age_seconds, 0)
+
+    def test_authority_rejects_custom_timing_configuration(self):
+        from engineering_gate_core.mutation_authority import GateMutationAuthority
+        with self.assertRaises(TypeError):
+            GateMutationAuthority(self.store, implementer_id="implementer", max_review_age_seconds=1)
+        with self.assertRaises(TypeError):
+            GateMutationAuthority(self.store, implementer_id="implementer", max_lease_seconds=1)
+
     def test_gate_authority_binds_persisted_workflow_and_lease_context(self):
         from dataclasses import replace
         from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
@@ -195,6 +329,19 @@ class AuthorizationLeaseTests(unittest.TestCase):
             self.store.reserve_mutation_lease("task-1", "auth-1", "b" * 64,
                 issued + timedelta(seconds=2))
         self.assertEqual(self.store.get_authorization("auth-1").status, AuthorizationLeaseStatus.EXPIRED)
+
+    def test_reservation_rejects_persisted_lease_with_extended_expiry(self):
+        self.registry.register_reviewer_key(self.key)
+        verified, payload, signature, issued = self.verdict()
+        self.store._record_verified_verdict("task-1", verified, payload, signature,
+            authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))
+        connection = self.store._connect()
+        connection.execute("UPDATE mutation_leases SET expires_at=? WHERE authorization_id=?",
+            ((issued + timedelta(seconds=301)).strftime("%Y-%m-%dT%H:%M:%SZ"), "auth-1"))
+        connection.commit()
+        connection.close()
+        with self.assertRaises(Exception):
+            self.store.reserve_mutation_lease("task-1", "auth-1", "b" * 64, issued)
 
     def test_reserved_lease_is_not_expired_by_later_clock(self):
         self.registry.register_reviewer_key(self.key)

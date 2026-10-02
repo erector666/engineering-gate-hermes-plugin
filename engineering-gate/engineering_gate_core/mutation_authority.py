@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+
 from .models import AuthorizationLeaseStatus, MutationLeaseRecord, MutationProposal, TaskState
 from .signed_authorization import SignedMutationVerdict, verify_signed_verdict
 from .state_store import StateStore
@@ -61,17 +62,11 @@ class MutationLease:
 
 
 class GateMutationAuthority:
-    def __init__(self, store, *, implementer_id, max_review_age_seconds=300, max_lease_seconds=300):
+    def __init__(self, store, *, implementer_id):
         if type(store) is not StateStore or type(implementer_id) is not str or not implementer_id.strip():
             raise ValueError("StateStore and immutable implementer_id are required")
-        if type(max_review_age_seconds) is not int or max_review_age_seconds < 0:
-            raise ValueError("max_review_age_seconds must be nonnegative")
-        if type(max_lease_seconds) is not int or max_lease_seconds <= 0:
-            raise ValueError("max_lease_seconds must be positive")
         self._store = store
         self._implementer_id = implementer_id
-        self._max_review_age_seconds = max_review_age_seconds
-        self._max_lease_seconds = max_lease_seconds
         self._clock_high_water = None
 
     def _now(self):
@@ -125,7 +120,7 @@ class GateMutationAuthority:
         key_id = self._payload_key_id(verdict)
         key = self._store.get_reviewer_key(key_id)
         verified = verify_signed_verdict(verdict, key, now=now, implementer_id=self._implementer_id,
-                                         max_review_age_seconds=self._max_review_age_seconds)
+            timing_policy=self._store.timing_policy)
         if (verified.task_id != str(task_id) or verified.plan_revision != int(state.revision)
                 or verified.plan_digest != str(state.plan_digest) or verified.proposal_digest != proposal_digest):
             raise MutationAuthorityError("signed verdict does not match current task, plan, or proposal")
@@ -136,7 +131,7 @@ class GateMutationAuthority:
         issued = now
         return self._store._record_verified_verdict(task_id, verified, verdict.canonical_payload,
             verdict.signature, authorization_id=uuid4().hex, issued_at=issued,
-            expires_at=issued + timedelta(seconds=self._max_lease_seconds))
+            expires_at=issued + timedelta(seconds=self._store.timing_policy.max_active_lease_seconds))
 
     @staticmethod
     def _payload_key_id(verdict):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from .authorization_policy import AUTHORIZATION_TIMING_V1, AuthorizationTimingPolicy
 import hashlib
 import json
 import re
@@ -85,7 +86,7 @@ def _fail(message):
     raise SignatureVerificationError(message)
 
 
-def verify_signed_verdict(verdict, key_record, *, now, implementer_id, max_review_age_seconds=300):
+def verify_signed_verdict(verdict, key_record, *, now, implementer_id, timing_policy=None):
     if Ed25519PublicKey is None:
         _fail("Ed25519 verification unavailable: install cryptography>=46,<51 with `pip install -r engineering-gate/requirements.txt`")
     if type(verdict) is not SignedMutationVerdict or type(key_record) is not ReviewerPublicKey:
@@ -94,8 +95,7 @@ def verify_signed_verdict(verdict, key_record, *, now, implementer_id, max_revie
         _fail("payload and signature must be bytes")
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() != timedelta(0):
         _fail("now must be a UTC-aware datetime")
-    if type(max_review_age_seconds) is not int or max_review_age_seconds < 0:
-        _fail("max_review_age_seconds must be a nonnegative integer")
+
     try:
         text = verdict.canonical_payload.decode("utf-8", errors="strict")
         payload = json.loads(text, object_pairs_hook=_pairs_no_duplicates,
@@ -142,7 +142,10 @@ def verify_signed_verdict(verdict, key_record, *, now, implementer_id, max_revie
     now = now.astimezone(timezone.utc)
     if reviewed_at > now:
         _fail("reviewed_at is in the future")
-    if now - reviewed_at > timedelta(seconds=max_review_age_seconds):
+    effective_policy = AUTHORIZATION_TIMING_V1 if timing_policy is None else timing_policy
+    if type(effective_policy) is not AuthorizationTimingPolicy:
+        _fail("AuthorizationTimingPolicy is required")
+    if now - reviewed_at > timedelta(seconds=effective_policy.max_review_age_seconds):
         _fail("reviewed_at exceeds maximum reviewer age")
     if type(key_record.public_key) is not bytes or len(key_record.public_key) != 32:
         _fail("trusted Ed25519 public key must be 32 bytes")

@@ -43,6 +43,13 @@ class SignedAuthorizationTests(unittest.TestCase):
                                   ReviewerPublicKey("key-1", "reviewer", "test", self.PUBLIC_KEY),
                                   now=datetime(2026, 10, 2, 10, 0, tzinfo=timezone.utc), implementer_id="agent")
 
+    def test_verifier_rejects_custom_freshness_override(self):
+        with self.assertRaises(TypeError):
+            verify_signed_verdict(SignedMutationVerdict(b"{}", b"x"),
+                ReviewerPublicKey("key-1", "reviewer", "test", self.PUBLIC_KEY),
+                now=datetime(2026, 10, 2, 10, tzinfo=timezone.utc), implementer_id="agent",
+                max_review_age_seconds=1)
+
     def test_rejects_field_mutations_with_original_signature(self):
         key = ReviewerPublicKey("key-1", "reviewer", "test", self.PUBLIC_KEY)
         for changes in ({"review_id": "other"}, {"task_id": "other"}, {"plan_revision": 3},
