@@ -75,14 +75,60 @@ class VerificationStoreTests(unittest.TestCase):
             expected_plan_digest=self.task.plan_digest, observations=observations)
 
     def test_valid_observations_round_trip_and_pass_review(self):
-        updated = self.record((self.observation("c1"), self.observation("c2")))
+        observations = (self.observation("c1"), self.observation("c2"))
+        execution_ids = tuple(item.execution_id for item in observations)
+        updated = self.record(observations)
         loaded = StateStore(self.db_path).load(self.task_id)
         self.assertEqual(loaded, updated)
+        self.assertEqual(tuple(item.execution_id for item in loaded.verification[0].evidence), (execution_ids[0],))
         self.assertEqual(loaded.state, TaskState.VERIFYING)
         self.assertTrue(all(result.passed for result in loaded.verification))
         self.assertEqual(len(loaded.verification), 2)
         self.assertEqual(self.store.transition(self.task_id, Event.RESULT_REVIEW_PASSED,
                          ResultReview(ReviewVerdict.PASS)).state, TaskState.HANDOFF)
+
+    def test_legacy_record_decode_allows_missing_observation_execution_id(self):
+        import json
+        from engineering_gate_core.state_store import StateStoreError, _record_from_json, _record_json
+        from engineering_gate_core.models import TaskStateRecord
+
+        observation = self.observation("c1")
+        record = TaskStateRecord(
+            task=self.task.task, state=self.task.state, revision=self.task.revision,
+            history=self.task.history, inspection=self.task.inspection, analysis=self.task.analysis,
+            plan=self.task.plan, plan_digest=self.task.plan_digest, blast_radius=self.task.blast_radius,
+            plan_review=self.task.plan_review, approval_request=self.task.approval_request,
+            approval=self.task.approval, permit=self.task.permit,
+            verification=(), result_review=None, handoff=None, evidence=(),
+        )
+        # Populate a realistic serialized record with a stored observation.
+        from dataclasses import replace
+        from engineering_gate_core.models import VerificationResult
+        record = replace(record, verification=(VerificationResult("c1", (observation,)),))
+        raw = json.loads(_record_json(record))
+        del raw["verification"]["$tuple"][0]["evidence"]["$tuple"][0]["execution_id"]
+        legacy_json = json.dumps(raw)
+
+        first = _record_from_json(legacy_json, allow_legacy_missing=True)
+        second = _record_from_json(legacy_json, allow_legacy_missing=True)
+        self.assertIsNone(first.verification[0].evidence[0].execution_id)
+        self.assertIsNone(second.verification[0].evidence[0].execution_id)
+        with self.assertRaises(StateStoreError):
+            _record_from_json(legacy_json)
+
+    def test_legacy_observation_without_execution_id_restores_unknown_consistently(self):
+        observation = self.observation("c1")
+        import json
+        from engineering_gate_core.state_store import _decode, _encode
+        serialized = _encode(observation)
+        serialized.pop("execution_id")
+        legacy_json = json.dumps(serialized)
+        restored_values = {key: _decode(value) for key, value in json.loads(legacy_json).items()
+                           if key != "$type"}
+        first = ObservedCommandEvidence._restore(**restored_values)
+        second = ObservedCommandEvidence._restore(**restored_values)
+        self.assertIsNone(first.execution_id)
+        self.assertIsNone(second.execution_id)
 
     def test_invalid_context_and_observations_are_atomic(self):
         one, two = self.observation("c1"), self.observation("c2")

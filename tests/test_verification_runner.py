@@ -80,6 +80,29 @@ class GateVerificationRunnerTests(unittest.TestCase):
         observed = [e for item in result.verification for e in item.evidence]
         self.assertEqual([e.criterion_id for e in observed], ["c1", "c2"])
         self.assertEqual([e.argv for e in observed], [command.argv for command in self.commands])
+        self.assertEqual(len({e.execution_id for e in observed}), 2)
+        self.assertTrue(all(item.passed for item in result.verification))
+
+    def test_shared_command_runs_once_and_associates_one_observation_with_each_criterion(self):
+        shared = VerificationCommand(
+            (sys.executable, "-c", "print('SHARED PASS')"), ("c1", "c2"), 3, 4096)
+        task_id = self.create_implementing((shared,))
+        real_observe = verification_execution._observe_verification_command
+        with patch.object(verification_execution, "_observe_verification_command",
+                          wraps=real_observe) as observe:
+            result = self.run_all(task_id)
+
+        observe.assert_called_once()
+        self.assertEqual([item.criterion_id for item in result.verification], ["c1", "c2"])
+        evidence = [item.evidence[0] for item in result.verification]
+        self.assertEqual([item.criterion_id for item in evidence], ["c1", "c2"])
+        self.assertEqual(evidence[0].argv, shared.argv)
+        self.assertTrue(evidence[0].execution_id)
+        self.assertEqual(evidence[0].execution_id, evidence[1].execution_id)
+        self.assertEqual(evidence[0].started_at, evidence[1].started_at)
+        self.assertEqual(evidence[0].completed_at, evidence[1].completed_at)
+        self.assertEqual(evidence[0].stdout_digest, evidence[1].stdout_digest)
+        self.assertEqual(evidence[0].stderr_digest, evidence[1].stderr_digest)
         self.assertTrue(all(item.passed for item in result.verification))
 
     def test_exit_one_with_pass_text_persists_failure_and_blocks_pass_review(self):

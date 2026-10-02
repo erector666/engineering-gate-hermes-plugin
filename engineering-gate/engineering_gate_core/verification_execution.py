@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 from .models import EvidenceProvenance, ObservedCommandEvidence, TaskState, VerificationCommand, WorkspaceIdentity, _ISSUER
 from .state_store import StateStoreError
@@ -160,6 +161,7 @@ def _observe_verification_command(command: VerificationCommand, *, task_id: str,
     output = _SECRET.sub(lambda m: m.group(1) + m.group(2) + "[REDACTED]", output)
     output = output[:_SUMMARY_MAX]
     return ObservedCommandEvidence._issue(_issuer=_ISSUER,
+        execution_id=uuid4().hex,
         task_id=task_id, plan_revision=plan_revision, plan_digest=plan_digest,
         criterion_id=criterion_id, argv=command.argv, workspace_identity=workspace_identity,
         started_at=started, completed_at=completed,
@@ -210,11 +212,22 @@ class GateVerificationRunner:
         commands = resolve_approved_verification_commands(plan, criteria)
         observations = []
         for command in commands:
-            for criterion_id in command.criterion_ids:
-                observations.append(_observe_verification_command(
-                    command, task_id=str(task.task_id), plan_revision=int(task.revision),
-                    plan_digest=task.plan_digest, criterion_id=criterion_id,
-                    workspace_identity=plan.workspace_identity))
+            observation = _observe_verification_command(
+                command, task_id=str(task.task_id), plan_revision=int(task.revision),
+                plan_digest=task.plan_digest, criterion_id=command.criterion_ids[0],
+                workspace_identity=plan.workspace_identity)
+            observations.append(observation)
+            for criterion_id in command.criterion_ids[1:]:
+                observations.append(type(observation)._issue(
+                    _issuer=_ISSUER, task_id=observation.task_id,
+                    plan_revision=observation.plan_revision, plan_digest=observation.plan_digest,
+                    criterion_id=criterion_id, argv=observation.argv,
+                    execution_id=observation.execution_id,
+                    workspace_identity=observation.workspace_identity,
+                    started_at=observation.started_at, completed_at=observation.completed_at,
+                    exit_code=observation.exit_code, stdout_digest=observation.stdout_digest,
+                    stderr_digest=observation.stderr_digest, output_summary=observation.output_summary,
+                    timed_out=observation.timed_out))
         return self.store._record_gate_verification(
             task_id, expected_revision=task.revision,
             expected_plan_digest=task.plan_digest, observations=tuple(observations))

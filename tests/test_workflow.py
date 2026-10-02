@@ -65,8 +65,10 @@ class WorkflowTests(unittest.TestCase):
             auth = MutationAuthorization("a1", task.task_id, task.revision, digest,
                                          canonical_mutation_proposal_digest(proposal), "provider",
                                          "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
-            authorized = record_mutation_authorization(recorded, auth, now="2026-10-01T10:30:00Z")
-            self.assertEqual(authorized.mutation_authorization, auth)
+            with self.assertRaises(TransitionError):
+                record_mutation_authorization(recorded, auth, now="2026-10-01T10:30:00Z")
+            # Legacy decoded claims are data only and cannot establish authority.
+            authorized = __import__("dataclasses").replace(recorded, mutation_authorization=auth)
             changed = MutationProposal("p2", task.task_id, task.revision, digest, op, mutation_argument_digest("different"), "write reviewed output")
             self.assertIsNone(record_mutation_proposal(authorized, changed).mutation_authorization)
 

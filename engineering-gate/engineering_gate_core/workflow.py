@@ -106,42 +106,8 @@ def record_mutation_proposal(state: TaskStateRecord, proposal: MutationProposal)
 
 
 def record_mutation_authorization(state: TaskStateRecord, authorization: MutationAuthorization, *, now=None) -> TaskStateRecord:
-    if type(authorization) is not MutationAuthorization or state.state is not TaskState.IMPLEMENTING or state.mutation_proposal is None:
-        raise TransitionError("authorization requires a current proposal in IMPLEMENTING state")
-    proposal = state.mutation_proposal
-    try:
-        plan_digest = canonical_plan_digest(state.plan) if state.plan is not None else None
-        if (state.plan is None or state.plan_digest != plan_digest or state.plan.workspace_identity is None
-                or state.plan_review is None or state.plan_review.verdict is not ReviewVerdict.APPROVED
-                or state.approval_request is None or state.approval is None or not state.approval.approved
-                or (state.approval.request_id, state.approval.task_id, state.approval.revision,
-                    state.approval.digest, state.approval.requester) !=
-                   (state.approval_request.request_id, state.approval_request.task_id,
-                    state.approval_request.revision, state.approval_request.digest, state.task.requester)
-                or (state.approval_request.task_id, state.approval_request.revision, state.approval_request.digest) !=
-                   (state.task_id, state.revision, plan_digest)
-                or state.permit is None or state.permit.task_id != state.task_id
-                or state.permit.revision != state.revision or state.permit.digest != plan_digest
-                or proposal.operation not in state.permit.scope.operations
-                or proposal.task_id != state.task_id or proposal.revision != state.revision
-                or proposal.plan_digest != plan_digest or proposal.operation not in state.plan.operations
-                or proposal.operation.kind is not OperationKind.WRITE):
-            raise TransitionError("authorization context is no longer current")
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise TransitionError("authorization context is malformed") from exc
-    if (authorization.task_id != state.task_id or authorization.revision != state.revision
-            or authorization.plan_digest != plan_digest
-            or authorization.proposal_digest != canonical_mutation_proposal_digest(proposal)):
-        raise TransitionError("authorization does not match current proposal and plan")
-    try:
-        instant = _parse_canonical_utc(datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if now is None else now) if isinstance(now, (str, type(None))) else now
-        start = _parse_canonical_utc(authorization.authorized_at)
-        expiry = _parse_canonical_utc(authorization.expires_at)
-    except (TypeError, ValueError) as exc:
-        raise TransitionError("authorization timestamps must be canonical UTC") from exc
-    if not isinstance(instant, datetime) or instant.tzinfo is None or instant.utcoffset() != timezone.utc.utcoffset(instant) or not start <= instant < expiry:
-        raise TransitionError("authorization is not currently valid")
-    return replace(state, mutation_authorization=authorization)
+    """Compatibility shim that cannot grant authority from caller-built data."""
+    raise TransitionError("caller-constructed MutationAuthorization is not write authority")
 
 
 def capture_workspace_identity(path: str) -> WorkspaceIdentity:
