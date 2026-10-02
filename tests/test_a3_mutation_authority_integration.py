@@ -2,6 +2,8 @@ import sys
 import tempfile
 import unittest
 import hashlib
+import multiprocessing
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +12,7 @@ sys.path.insert(0, str(ROOT / "engineering-gate"))
 
 from engineering_gate_core.a3_execution import GateWriteService
 from engineering_gate_core.mutation_authority import GateMutationAuthority
+from engineering_gate_core.mutation_authority import ReviewerKeyRegistry
 from engineering_gate_core.state_store import StateStore
 from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, ExecutionPermit,
     MutationProposal, MutationScope, NormalizedOperation, OperationKind, Plan, PlanReview, RequesterIdentity,
@@ -30,10 +33,11 @@ class MutationAuthorityExecutionIntegrationTests(unittest.TestCase):
         self.root = self.base / "workspace"
         self.root.mkdir()
         self.store = StateStore(self.base / "state.sqlite3")
+        self.registry = ReviewerKeyRegistry(self.store)
         self.private = Ed25519PrivateKey.generate()
         public = self.private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.key = ReviewerPublicKey("key-1", "reviewer", "provider", public)
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         self.op = NormalizedOperation(OperationKind.WRITE, "approved.txt", "write")
         self.content = "approved content"
         self.store.create(new_task("task-1", "write file", RequesterIdentity("requester")))
@@ -93,17 +97,118 @@ class MutationAuthorityExecutionIntegrationTests(unittest.TestCase):
             self.service.execute(permit, task_id="task-1", operation=self.op, arguments={"content":self.content})
         self.assertFalse((self.root / self.op.target).exists())
 
-    def test_staging_precedes_durable_reservation_and_target_replacement(self):
+    def test_durable_reservation_precedes_staging_and_target_replacement(self):
+        import engineering_gate_core.a3_execution as a3_execution
         permit = self.permit()
         reserve = self.store.reserve_mutation_lease
+        original_open = a3_execution.os.open
         events = []
-        def observe(*args, **kwargs):
-            staged = list(self.root.glob(".gate-write-*.tmp"))
-            events.append(("reserve", bool(staged), (self.root / self.op.target).exists()))
+
+        def observe_reservation(*args, **kwargs):
+            self.assertEqual(list(self.root.glob(".gate-write-*.tmp")), [])
+            events.append(("reserve", self.store.get_authorization(self.authorization.authorization_id).status.value,
+                           (self.root / self.op.target).exists()))
             return reserve(*args, **kwargs)
-        self.store.reserve_mutation_lease = observe
+
+        def observe_stage_open(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if isinstance(path, str) and path.startswith(".gate-write-"):
+                events.append(("stage", self.store.get_authorization(self.authorization.authorization_id).status.value,
+                               list(self.root.glob(".gate-write-*.tmp")) != []))
+            return fd
+
+        self.store.reserve_mutation_lease = observe_reservation
+        a3_execution.os.open = observe_stage_open
+        self.addCleanup(setattr, a3_execution.os, "open", original_open)
+        self.addCleanup(setattr, self.store, "reserve_mutation_lease", reserve)
         self.service.execute(permit, task_id="task-1", operation=self.op, arguments={"content":self.content})
-        self.assertEqual(events, [("reserve", True, False)])
+        self.assertEqual(events, [("reserve", "ACTIVE", False), ("stage", "RESERVED", True)])
+        self.assertTrue((self.root / self.op.target).exists())
+
+    def test_staging_write_failure_consumes_reservation_and_cleans_temporary_file(self):
+        import engineering_gate_core.a3_execution as a3_execution
+        permit = self.permit()
+        original_write = a3_execution.os.write
+
+        def fail_stage_write(fd, data):
+            raise OSError("injected staging failure")
+
+        a3_execution.os.write = fail_stage_write
+        self.addCleanup(setattr, a3_execution.os, "write", original_write)
+        with self.assertRaises(PermissionError):
+            self.service.execute(permit, task_id="task-1", operation=self.op, arguments={"content":self.content})
+        self.assertEqual(self.store.get_authorization(self.authorization.authorization_id).status.value, "CONSUMED")
+        self.assertEqual(list(self.root.glob(".gate-write-*.tmp")), [])
+        self.assertFalse((self.root / self.op.target).exists())
+
+    def test_reviewer_key_revoked_before_reservation_blocks_without_staging(self):
+        permit = self.permit()
+        self.registry.revoke_reviewer_key("key-1", reason="rotation")
+        with self.assertRaises(PermissionError):
+            self.service.execute(permit, task_id="task-1", operation=self.op, arguments={"content":self.content})
+        self.assertEqual(self.store.get_authorization(self.authorization.authorization_id).status.value, "REVOKED")
+        self.assertEqual(list(self.root.glob(".gate-write-*.tmp")), [])
+        self.assertFalse((self.root / self.op.target).exists())
+
+    def test_reservation_wins_key_revocation_during_first_staging_open(self):
+        import engineering_gate_core.a3_execution as a3_execution
+        permit = self.permit()
+        original_open = a3_execution.os.open
+        revoked = []
+
+        def revoke_after_stage_create(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if isinstance(path, str) and path.startswith(".gate-write-") and not revoked:
+                self.assertEqual(self.store.get_authorization(self.authorization.authorization_id).status.value, "RESERVED")
+                self.registry.revoke_reviewer_key("key-1", reason="rotation")
+                revoked.append(True)
+            return fd
+
+        a3_execution.os.open = revoke_after_stage_create
+        self.addCleanup(setattr, a3_execution.os, "open", original_open)
+        self.service.execute(permit, task_id="task-1", operation=self.op, arguments={"content":self.content})
+        self.assertEqual(revoked, [True])
+        self.assertEqual((self.root / self.op.target).read_text(), self.content)
+        self.assertEqual(self.store.get_authorization(self.authorization.authorization_id).status.value, "CONSUMED")
+        self.assertEqual(self.store.get_reviewer_key("key-1").revoked, True)
+
+    def test_process_crash_after_staging_recovers_uncertain_and_orphan_is_not_reusable(self):
+        import engineering_gate_core.a3_execution as a3_execution
+        permit = self.permit()
+        original_write = a3_execution.os.write
+        context = multiprocessing.get_context("fork")
+
+        def crash_after_stage_bytes(fd, data):
+            written = original_write(fd, data)
+            if written:
+                staged = list(self.root.glob(".gate-write-*.tmp"))
+                if staged:
+                    os._exit(73)
+            return written
+
+        def child_execute():
+            a3_execution.os.write = crash_after_stage_bytes
+            self.service.execute(permit, task_id="task-1", operation=self.op,
+                                 arguments={"content":self.content})
+
+        process = context.Process(target=child_execute)
+        process.start()
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            self.fail("child execution did not reach the staged-write crash point")
+        self.assertEqual(process.exitcode, 73)
+        orphaned = list(self.root.glob(".gate-write-*.tmp"))
+        self.assertEqual(len(orphaned), 1)
+        self.assertEqual(orphaned[0].read_text(), self.content)
+
+        reopened = StateStore(self.base / "state.sqlite3")
+        self.assertEqual(reopened.get_authorization(self.authorization.authorization_id).status.value,
+                         "CONSUMED_UNCERTAIN")
+        with self.assertRaises(Exception):
+            self.authority.acquire_write_lease("task-1", self.authorization.authorization_id,
+                                               self.proposal).__enter__()
 
     def test_mismatched_proposal_request_is_denied_without_reserving_authorization(self):
         permit = self.permit()
@@ -112,6 +217,7 @@ class MutationAuthorityExecutionIntegrationTests(unittest.TestCase):
                                  arguments={"content":"different content"})
         self.assertFalse((self.root / self.op.target).exists())
         self.assertEqual(self.store.get_authorization(self.authorization.authorization_id).status.value, "ACTIVE")
+        self.assertEqual(list(self.root.glob(".gate-write-*.tmp")), [])
 
     def test_audit_insert_failure_after_replacement_is_uncertain_and_consumes_uncertain(self):
         import sqlite3
@@ -129,7 +235,10 @@ class MutationAuthorityExecutionIntegrationTests(unittest.TestCase):
             return result
 
         def tracked_open(path, flags, *args, **kwargs):
+            nonlocal stage_complete
             result = original_open(path, flags, *args, **kwargs)
+            if isinstance(path, str) and path.startswith(".gate-write-"):
+                stage_complete = True
             if not stage_complete and flags & a3_execution.os.O_DIRECTORY:
                 fd_lifetimes[result] = 0
             return result
@@ -143,13 +252,6 @@ class MutationAuthorityExecutionIntegrationTests(unittest.TestCase):
         self.addCleanup(setattr, a3_execution.os, "dup", original_dup)
         self.addCleanup(setattr, a3_execution.os, "open", original_open)
         self.addCleanup(setattr, a3_execution.os, "close", original_close)
-        reserve = self.store.reserve_mutation_lease
-        self.addCleanup(setattr, self.store, "reserve_mutation_lease", reserve)
-        def mark_staged(*args, **kwargs):
-            nonlocal stage_complete
-            stage_complete = True
-            return reserve(*args, **kwargs)
-        self.store.reserve_mutation_lease = mark_staged
 
         class AuditFailingConnection:
             def __init__(self, connection):
@@ -176,6 +278,17 @@ class MutationAuthorityExecutionIntegrationTests(unittest.TestCase):
 
 
 class RequiredMutationAuthorityInterfaceTests(unittest.TestCase):
+    def test_runtime_authority_has_no_operator_key_or_store_capabilities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "state.sqlite3")
+            authority = GateMutationAuthority(store, implementer_id="implementer")
+            self.assertFalse(hasattr(authority, "register_reviewer_key"))
+            self.assertFalse(hasattr(authority, "revoke_reviewer_key"))
+            self.assertFalse(hasattr(authority, "store"))
+            self.assertTrue(authority.is_bound_to(store))
+            self.assertTrue(hasattr(ReviewerKeyRegistry(store), "register_reviewer_key"))
+            self.assertTrue(hasattr(ReviewerKeyRegistry(store), "revoke_reviewer_key"))
+
     def test_service_requires_store_and_authority_and_binds_the_identical_store(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "workspace"

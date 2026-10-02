@@ -91,7 +91,7 @@ class GateWriteService:
         from .state_store import StateStore
         if type(state_store) is not StateStore or type(mutation_authority) is not GateMutationAuthority:
             raise TypeError("StateStore and GateMutationAuthority are required")
-        if mutation_authority.store is not state_store:
+        if not mutation_authority.is_bound_to(state_store):
             raise ValueError("mutation authority must use the identical StateStore")
         self._state_store = state_store
         self._mutation_authority = mutation_authority
@@ -420,9 +420,9 @@ class GateWriteService:
                     or current.revision != binding.revision
                     or current.plan_digest != binding.plan_digest):
                 raise PermissionError("execution request does not match permit authorization")
-            stage_current(current)
             with self._mutation_authority.acquire_write_lease(
                     task_id, binding.authorization_digest, current.mutation_proposal) as active_lease:
+                stage_current(current)
                 outcome = self._state_transaction(task_id, execute_current)
                 if (isinstance(outcome, ExecutionTransactionResult)
                         and outcome.audit_record.outcome is ExecutionOutcome.SUCCEEDED
