@@ -18,7 +18,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
         from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
             ExecutionPermit, MutationProposal, MutationScope, NormalizedOperation, OperationKind,
             Plan, PlanReview, PlanRevision, RequesterIdentity, ReviewVerdict, Task, TaskState, TaskStateRecord)
-        from engineering_gate_core.mutation_authority import GateMutationAuthority
+        from engineering_gate_core.mutation_authority import GateMutationAuthority, ReviewerKeyRegistry
         from engineering_gate_core.workflow import (canonical_plan_digest, canonical_mutation_proposal_digest,
             mutation_argument_digest, capture_workspace_identity)
         now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -41,7 +41,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
             connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (__import__("engineering_gate_core.state_store", fromlist=["_record_json"])._record_json(state), "task-1"))
             connection.commit()
             connection.close()
-            self.store.register_reviewer_key(self.key)
+            self.registry.register_reviewer_key(self.key)
             authority = GateMutationAuthority(self.store, implementer_id="implementer")
             authority._now = lambda: now
             from engineering_gate_core.signed_authorization import DOMAIN_PREFIX, SignedMutationVerdict, canonical_signed_verdict
@@ -69,6 +69,8 @@ class AuthorizationLeaseTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "state.sqlite3"
         self.store = StateStore(self.path)
+        from engineering_gate_core.mutation_authority import ReviewerKeyRegistry
+        self.registry = ReviewerKeyRegistry(self.store)
         self.private_key = Ed25519PrivateKey.generate()
         public = self.private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.key = ReviewerPublicKey("key-1", "reviewer", "provider", public)
@@ -89,14 +91,14 @@ class AuthorizationLeaseTests(unittest.TestCase):
         return verified, encoded, signature, now
 
     def test_key_registration_and_revocation_persist(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         self.assertEqual(self.store.get_reviewer_key("key-1"), self.key)
-        self.store.revoke_reviewer_key("key-1", reason="rotation")
+        self.registry.revoke_reviewer_key("key-1", reason="rotation")
         self.assertTrue(self.store.get_reviewer_key("key-1").revoked)
         self.assertEqual(self.store.list_authorization_audit(key_id="key-1")[0][3:5], ("KEY_REVOKED", "rotation"))
 
     def test_approved_verdict_is_persisted_and_reserved_once(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         lease = self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))
@@ -110,29 +112,29 @@ class AuthorizationLeaseTests(unittest.TestCase):
             self.store.reserve_mutation_lease("task-1", "auth-1", "b" * 64, issued)
 
     def test_reject_verdict_is_audited_without_lease(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, now = self.verdict(verdict="reject")
         self.assertIsNone(self.store._record_verified_verdict("task-1", verified,
             payload, signature, authorization_id=None, issued_at=None, expires_at=None))
         self.assertEqual(len(self.store.list_signed_verdicts("task-1")), 1)
 
     def test_key_revocation_blocks_existing_active_authorization(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))
-        self.store.revoke_reviewer_key("key-1", reason="compromised")
+        self.registry.revoke_reviewer_key("key-1", reason="compromised")
         self.assertEqual(self.store.get_authorization("auth-1").status, AuthorizationLeaseStatus.REVOKED)
         with self.assertRaises(Exception):
             self.store.reserve_mutation_lease("task-1", "auth-1", "b" * 64, issued)
 
     def test_revocation_after_reservation_does_not_expire_or_reuse_lease(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))
         reserved = self.store.reserve_mutation_lease("task-1", "auth-1", "b" * 64, datetime.now(timezone.utc))
-        self.store.revoke_reviewer_key("key-1", reason="rotation")
+        self.registry.revoke_reviewer_key("key-1", reason="rotation")
         current = self.store.get_authorization("auth-1")
         self.assertEqual(current.status, AuthorizationLeaseStatus.RESERVED)
         self.assertEqual(current.reservation_id, reserved.reservation_id)
@@ -141,7 +143,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
 
     def test_reservation_and_key_revocation_serialize(self):
         import threading
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))
@@ -157,7 +159,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
         def revoke():
             barrier.wait()
             try:
-                self.store.revoke_reviewer_key("key-1", reason="race")
+                self.registry.revoke_reviewer_key("key-1", reason="race")
                 outcomes.append("revoked")
             except Exception:
                 outcomes.append("revoke-failed")
@@ -174,7 +176,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
             self.assertIn("blocked", outcomes)
 
     def test_known_completion_burns_reservation(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))
@@ -185,7 +187,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
             self.store.reserve_mutation_lease("task-1", "auth-1", "b" * 64, datetime.now(timezone.utc))
 
     def test_expired_active_lease_is_not_reservable(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=1))
@@ -195,7 +197,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
         self.assertEqual(self.store.get_authorization("auth-1").status, AuthorizationLeaseStatus.EXPIRED)
 
     def test_reserved_lease_is_not_expired_by_later_clock(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=1))
@@ -206,7 +208,7 @@ class AuthorizationLeaseTests(unittest.TestCase):
         self.assertEqual(finished.status, AuthorizationLeaseStatus.CONSUMED)
 
     def test_restart_consumes_reserved_lease_as_uncertain(self):
-        self.store.register_reviewer_key(self.key)
+        self.registry.register_reviewer_key(self.key)
         verified, payload, signature, issued = self.verdict()
         self.store._record_verified_verdict("task-1", verified, payload, signature,
             authorization_id="auth-1", issued_at=issued, expires_at=issued + timedelta(seconds=300))

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
 from engineering_gate_core.a3_execution import GateWriteService
-from engineering_gate_core.mutation_authority import GateMutationAuthority
+from engineering_gate_core.mutation_authority import GateMutationAuthority, ReviewerKeyRegistry
 from datetime import datetime, timezone, timedelta
 from engineering_gate_core.models import (
     AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence,
@@ -85,7 +85,7 @@ class StateStoreGateWriteIntegrationTests(unittest.TestCase):
         from engineering_gate_core.signed_authorization import ReviewerPublicKey, SignedMutationVerdict, DOMAIN_PREFIX, canonical_signed_verdict
         self.private = Ed25519PrivateKey.generate()
         public = self.private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        self.store.register_reviewer_key(ReviewerPublicKey("key-1", "reviewer", "provider", public))
+        ReviewerKeyRegistry(self.store).register_reviewer_key(ReviewerPublicKey("key-1", "reviewer", "provider", public))
         state = self.store.load("task-1")
         payload = {"schema_version":1,"signature_algorithm":"Ed25519","key_id":"key-1","review_id":"review-1",
           "reviewer_id":"reviewer","reviewer_provider":"provider","implementer_id":"implementer","task_id":"task-1",

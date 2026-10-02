@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
 from engineering_gate_core.a3_execution import GateWriteService
-from engineering_gate_core.mutation_authority import GateMutationAuthority
+from engineering_gate_core.mutation_authority import GateMutationAuthority, ReviewerKeyRegistry
 from engineering_gate_core.state_store import StateStore
 from engineering_gate_core.signed_authorization import ReviewerPublicKey, SignedMutationVerdict, DOMAIN_PREFIX, canonical_signed_verdict
 from datetime import datetime, timezone
@@ -52,7 +52,7 @@ class GateOwnedWriteTests(unittest.TestCase):
         self.states = StateMapping(self.store)
         self.private_key = Ed25519PrivateKey.generate()
         public_key = self.private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        self.store.register_reviewer_key(ReviewerPublicKey("reviewer-key", "reviewer", "test", public_key))
+        ReviewerKeyRegistry(self.store).register_reviewer_key(ReviewerPublicKey("reviewer-key", "reviewer", "test", public_key))
         self.authorization_provider = GateMutationAuthority(self.store, implementer_id="test-implementer")
         self.transaction_calls = 0
         def state_transaction(task_id, callback):

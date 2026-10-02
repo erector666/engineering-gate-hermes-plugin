@@ -16,6 +16,20 @@ class MutationAuthorityError(ValueError):
     """Signed authorization cannot be accepted or used in the current workflow."""
 
 
+class ReviewerKeyRegistry:
+    """Trusted operator capability for provisioning reviewer signing keys."""
+    def __init__(self, store):
+        if type(store) is not StateStore:
+            raise ValueError("StateStore is required")
+        self._store = store
+
+    def register_reviewer_key(self, key_record):
+        self._store._register_reviewer_key(key_record)
+
+    def revoke_reviewer_key(self, key_id, *, reason):
+        self._store._revoke_reviewer_key(key_id, reason=reason)
+
+
 @dataclass
 class MutationLease:
     """A durably reserved, one-use lease held around one WRITE attempt."""
@@ -70,10 +84,9 @@ class GateMutationAuthority:
         self._clock_high_water = now
         return now
 
-    @property
-    def store(self):
-        """The exact durable store governed by this authority (read-only)."""
-        return self._store
+    def is_bound_to(self, store):
+        """Check binding without exposing the underlying store capability."""
+        return self._store is store
 
     @staticmethod
     def _current_binding(state, task_id, proposal):
@@ -102,11 +115,6 @@ class GateMutationAuthority:
             raise MutationAuthorityError("proposal is outside current permit scope")
         return state, canonical_mutation_proposal_digest(state.mutation_proposal)
 
-    def register_reviewer_key(self, key_record):
-        self._store.register_reviewer_key(key_record)
-
-    def revoke_reviewer_key(self, key_id, *, reason):
-        self._store.revoke_reviewer_key(key_id, reason=reason)
 
     def record_signed_verdict(self, task_id, verdict):
         if type(verdict) is not SignedMutationVerdict:
@@ -180,4 +188,4 @@ class GateMutationAuthority:
             self._store.finish_mutation_lease(authorization_id, reserved.reservation_id, outcome=outcome)
 
 
-__all__ = ["GateMutationAuthority", "MutationAuthorityError", "MutationLease"]
+__all__ = ["GateMutationAuthority", "MutationAuthorityError", "MutationLease", "ReviewerKeyRegistry"]

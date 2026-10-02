@@ -629,7 +629,7 @@ class StateStore:
                     mutation_proposal=None, mutation_authorization=None)
         return record
 
-    def register_reviewer_key(self, key_record):
+    def _register_reviewer_key(self, key_record):
         from .signed_authorization import ReviewerPublicKey
         if type(key_record) is not ReviewerPublicKey or not key_record.key_id or len(key_record.key_id) > 256:
             raise StateStoreError("invalid reviewer key record")
@@ -663,7 +663,7 @@ class StateStore:
             raise StateStoreError("reviewer key not found")
         return ReviewerPublicKey(row[0], row[1], row[2], bytes(row[3]), bool(row[4]), bool(row[5]))
 
-    def revoke_reviewer_key(self, key_id, *, reason):
+    def _revoke_reviewer_key(self, key_id, *, reason):
         if type(reason) is not str or not reason.strip() or len(reason) > 512:
             raise StateStoreError("revocation reason is required and bounded")
         connection = self._connect()
