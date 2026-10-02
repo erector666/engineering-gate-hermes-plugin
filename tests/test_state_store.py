@@ -235,41 +235,39 @@ class StateStoreTests(unittest.TestCase):
         self.assertIs(loaded.state, TaskState.INSPECT)
         self.assertEqual(loaded.task.requester, RequesterIdentity("user-1"))
 
-    def test_mutation_records_persist_and_round_trip_typed(self):
+    def test_caller_built_mutation_authorization_is_rejected_without_state_change(self):
         import sqlite3
         from dataclasses import replace
         from engineering_gate_core.state_store import StateStore, _record_json
-        from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ExecutionPermit,
-            MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation, OperationKind,
-            ApprovalRequest, Plan, PlanDigest, PlanReview, PlanRevision, ReviewVerdict)
+        from engineering_gate_core.workflow import TransitionError
+        from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
+            ExecutionPermit, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation,
+            OperationKind, Plan, PlanRevision, PlanReview, ReviewVerdict)
         from engineering_gate_core.workflow import (canonical_mutation_proposal_digest, canonical_plan_digest,
-            mutation_argument_digest)
-        base = self.record
-        from dataclasses import replace
-        import tempfile
+            mutation_argument_digest, capture_workspace_identity)
         op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update output")
         root = str(Path(self.temp.name).resolve())
         plan = Plan("inspect project", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
-                    workspace_root=root, workspace_identity=__import__("engineering_gate_core.workflow", fromlist=["capture_workspace_identity"]).capture_workspace_identity(root))
+                    workspace_root=root, workspace_identity=capture_workspace_identity(root))
         digest = canonical_plan_digest(plan)
-        current = replace(base, state=TaskState.IMPLEMENTING, revision=PlanRevision(1), plan=plan,
+        current = replace(self.record, state=TaskState.IMPLEMENTING, revision=PlanRevision(1), plan=plan,
             plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
-            approval_request=ApprovalRequest(base.task_id, PlanRevision(1), digest, "r"),
-            approval=ApprovalReceipt("r", base.task_id, PlanRevision(1), digest, base.task.requester, True),
-            permit=ExecutionPermit(base.task_id, PlanRevision(1), digest, MutationScope((op,))))
+            approval_request=ApprovalRequest(self.record.task_id, 1, digest, "r"),
+            approval=ApprovalReceipt("r", self.record.task_id, 1, digest, self.record.task.requester, True),
+            permit=ExecutionPermit(self.record.task_id, 1, digest, MutationScope((op,))))
         store = StateStore(self.path)
-        store.create(base)
+        store.create(self.record)
         with sqlite3.connect(self.path) as db:
-            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(current), str(base.task_id)))
-        proposal = MutationProposal("p", base.task_id, PlanRevision(1), digest, op,
+            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(current), self.record.task_id))
+        proposal = MutationProposal("p", self.record.task_id, 1, digest, op,
                                     mutation_argument_digest("hello"), "reviewed write")
-        recorded = store.record_mutation_proposal(base.task_id, proposal)
-        auth = MutationAuthorization("a", base.task_id, PlanRevision(1), digest,
+        store.record_mutation_proposal(self.record.task_id, proposal)
+        before = store.load(self.record.task_id)
+        auth = MutationAuthorization("a", self.record.task_id, 1, digest,
             canonical_mutation_proposal_digest(proposal), "provider", "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
-        result = store.record_mutation_authorization(base.task_id, auth, now="2026-10-01T10:30:00Z")
-        self.assertEqual(store.load(base.task_id), result)
-        self.assertEqual(result.mutation_proposal, proposal)
-        self.assertEqual(result.mutation_authorization, auth)
+        with self.assertRaises(TransitionError):
+            store.record_mutation_authorization(self.record.task_id, auth, now="2026-10-01T10:30:00Z")
+        self.assertEqual(store.load(self.record.task_id), before)
 
     def test_mutation_persistence_rejects_wrong_task_key_without_write(self):
         import sqlite3
@@ -566,11 +564,24 @@ class StateStoreTests(unittest.TestCase):
         current = replace(current, mutation_authorization=authorization)
         with sqlite3.connect(self.path) as db:
             db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (__import__("engineering_gate_core.state_store", fromlist=["_record_json"])._record_json(current), self.record.task_id))
+            db.execute("INSERT INTO reviewer_keys VALUES(?,?,?,?,?,?,?)", ("key-a", "reviewer", "provider", b"k" * 32, 1, 0, stamp))
+            db.execute("INSERT INTO signed_verdicts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "review-a", "4" * 64, self.record.task_id, "key-a", b"payload", b"signature", "approve",
+                "reviewer", "provider", "implementer", 1, digest, canonical_mutation_proposal_digest(proposal), stamp, stamp))
+            lease_values = ("a", "review-a", self.record.task_id, 1, digest, canonical_mutation_proposal_digest(proposal),
+                "reviewer", "provider", "implementer", "key-a", stamp, stamp, "2099-01-01T00:00:00Z", "RESERVED", "reservation-a", "4" * 64)
+            db.execute("INSERT INTO mutation_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lease_values)
         ws = plan.workspace_identity
         audit = ExecutionAuditRecord("audit-1", self.record.task_id, 1, digest, authorization.proposal_digest,
             "a", "1" * 64, OperationKind.WRITE, "output.txt", proposal.argument_digest, ws,
             stamp, stamp, ExecutionOutcome.SUCCEEDED, "2" * 64)
         result = ExecutionTransactionResult(audit, False)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DELETE FROM mutation_leases WHERE authorization_id='a'")
+        with self.assertRaises(StateStoreError):
+            store.with_current_state_transaction(self.record.task_id, lambda _: result)
+        with sqlite3.connect(self.path) as db:
+            db.execute("INSERT INTO mutation_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lease_values)
         store.with_current_state_transaction(self.record.task_id, lambda _: result)
         self.assertEqual(store.list_execution_audits(self.record.task_id), (audit,))
 
@@ -689,8 +700,33 @@ class StateStoreTests(unittest.TestCase):
         reopened = StateStore(self.path)
         self.assertEqual(reopened.load("task-1"), self.record)
         with sqlite3.connect(self.path) as db:
-            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "4")
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "5")
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_audit'").fetchone())
+
+    def test_v4_migrates_to_v5_authorization_schema(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore
+        store = StateStore(self.path)
+        store.create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE metadata SET value='4' WHERE key='schema_version'")
+            for table in ("mutation_leases", "signed_verdicts", "reviewer_keys", "authorization_audit"):
+                db.execute(f"DROP TABLE {table}")
+        reopened = StateStore(self.path)
+        self.assertEqual(reopened.load("task-1"), self.record)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "5")
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({"reviewer_keys", "signed_verdicts", "mutation_leases", "authorization_audit"}.issubset(tables))
+
+    def test_authorization_clock_high_watermark_blocks_backwards_open(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE metadata SET value='2999-01-01T00:00:00Z' WHERE key='authorization_clock_high_watermark'")
+        with self.assertRaisesRegex(StateStoreError, "clock moved backwards"):
+            StateStore(self.path)
 
     def test_v3_migration_sanitizes_legacy_nested_result_and_is_idempotent(self):
         import json, sqlite3

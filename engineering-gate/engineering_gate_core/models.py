@@ -1,6 +1,8 @@
 """Host-neutral, immutable lifecycle value objects."""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
+from uuid import uuid4
 import re
 from pathlib import PureWindowsPath
 from typing import NewType
@@ -285,6 +287,52 @@ class MutationAuthorization:
             raise ValueError("authorization expiry must follow authorization time")
 
 
+class AuthorizationLeaseStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    RESERVED = "RESERVED"
+    CONSUMED = "CONSUMED"
+    CONSUMED_UNCERTAIN = "CONSUMED_UNCERTAIN"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
+
+
+@dataclass(frozen=True)
+class MutationLeaseRecord:
+    authorization_id: str
+    review_id: str
+    task_id: TaskID
+    plan_revision: int
+    plan_digest: str
+    proposal_digest: str
+    reviewer_id: str
+    reviewer_provider: str
+    implementer_id: str
+    key_id: str
+    reviewed_at: datetime
+    issued_at: datetime
+    expires_at: datetime
+    status: AuthorizationLeaseStatus
+    reservation_id: str | None
+    payload_digest: str
+
+    def __post_init__(self):
+        for name in ("authorization_id", "review_id", "task_id", "reviewer_id", "reviewer_provider", "implementer_id", "key_id"):
+            if type(getattr(self, name)) is not str or not getattr(self, name):
+                raise ValueError(f"{name} is required")
+        if type(self.plan_revision) is not int or self.plan_revision < 0:
+            raise ValueError("invalid plan revision")
+        for name in ("plan_digest", "proposal_digest", "payload_digest"):
+            _require_digest(getattr(self, name), name)
+        for name in ("reviewed_at", "issued_at", "expires_at"):
+            value = getattr(self, name)
+            if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+                raise ValueError(f"{name} must be UTC-aware")
+        if self.expires_at <= self.issued_at or type(self.status) is not AuthorizationLeaseStatus:
+            raise ValueError("invalid lease status or expiry")
+        if self.status is AuthorizationLeaseStatus.RESERVED and not self.reservation_id:
+            raise ValueError("reserved lease requires reservation ID")
+
+
 @dataclass(frozen=True)
 class MutationScope:
     operations: tuple[NormalizedOperation, ...]
@@ -323,6 +371,7 @@ class Evidence:
 
 @dataclass(frozen=True, init=False)
 class ObservedCommandEvidence:
+    execution_id: str | None
     task_id: TaskID
     plan_revision: int
     plan_digest: str
@@ -340,7 +389,7 @@ class ObservedCommandEvidence:
 
     def __init__(self, task_id, plan_revision, plan_digest, criterion_id, provenance, argv,
                  workspace_identity, started_at, completed_at, exit_code, stdout_digest,
-                 stderr_digest, output_summary, timed_out, *, _issuer=None):
+                 stderr_digest, output_summary, timed_out, *, execution_id=None, _issuer=None):
         if _issuer is not _ISSUER:
             raise ValueError("ObservedCommandEvidence must be issued by the gate or internally restored")
         for name, value in locals().copy().items():
@@ -353,6 +402,8 @@ class ObservedCommandEvidence:
         from datetime import datetime
         if self.provenance is not EvidenceProvenance.GATE_OBSERVED:
             raise ValueError("observations require GATE_OBSERVED provenance")
+        if self.execution_id is not None and (type(self.execution_id) is not str or not self.execution_id):
+            raise ValueError("invalid execution_id")
         if (not isinstance(self.task_id, str) or not self.task_id or type(self.plan_revision) is not int
                 or self.plan_revision < 0 or not isinstance(self.criterion_id, str) or not self.criterion_id):
             raise ValueError("invalid observation binding")
@@ -383,10 +434,12 @@ class ObservedCommandEvidence:
         if _issuer is not _ISSUER:
             raise ValueError("ObservedCommandEvidence must be issued by the gate or internally restored")
         values["provenance"] = EvidenceProvenance.GATE_OBSERVED
+        values.setdefault("execution_id", uuid4().hex)
         return cls(**values, _issuer=_ISSUER)
 
     @classmethod
     def _restore(cls, **values):
+        values.setdefault("execution_id", None)
         values.setdefault("provenance", EvidenceProvenance.GATE_OBSERVED)
         return cls(**values, _issuer=_ISSUER)
 
@@ -482,7 +535,7 @@ class TaskStateRecord:
 __all__ = [
     "AcceptanceCriterion", "ApprovalReceipt", "ApprovalRequest", "ChildTaskLease", "ExecutionAuditRecord", "ExecutionOutcome", "ExecutionTransactionResult",
     "Evidence", "EvidenceProvenance", "ObservedCommandEvidence", "ExecutionPermit", "Handoff", "InspectionEvidenceRef",
-    "MutationAuthorization", "MutationProposal", "MutationScope", "NormalizedOperation", "OperationKind", "Plan", "PlanDigest",
+    "AuthorizationLeaseStatus", "MutationLeaseRecord", "MutationAuthorization", "MutationProposal", "MutationScope", "NormalizedOperation", "OperationKind", "Plan", "PlanDigest",
     "PlanReview", "PlanRevision", "RequesterIdentity", "ResultReview",
     "ReviewVerdict", "Task", "TaskID", "TaskState", "TaskStateRecord",
     "VerificationCommand", "VerificationResult", "WorkspaceIdentity",

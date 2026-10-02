@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 
 from engineering_gate_core.a3_execution import GateWriteService
+from engineering_gate_core.mutation_authority import GateMutationAuthority
 from datetime import datetime, timezone, timedelta
 from engineering_gate_core.models import (
     AcceptanceCriterion, ApprovalReceipt, ApprovalRequest, Evidence,
@@ -79,16 +80,22 @@ class StateStoreGateWriteIntegrationTests(unittest.TestCase):
                                     self.operation, mutation_argument_digest(content), "test-only proposal")
         self.store.record_mutation_proposal("task-1", proposal)
         now = datetime.now(timezone.utc).replace(microsecond=0)
-        authorization = MutationAuthorization("auth-1", "task-1", current.revision, current.plan_digest,
-            canonical_mutation_proposal_digest(proposal), "synthetic-test-provider",
-            now.isoformat().replace("+00:00", "Z"), (now + timedelta(days=1)).isoformat().replace("+00:00", "Z"))
-        self.store.record_mutation_authorization("task-1", authorization, now=now)
-        self.authorization_provider = SyntheticAuthorizationProvider()
-        self.service = GateWriteService(self.root, state_loader=self.store.load,
-                                       state_transaction=self.store.with_current_state_transaction,
-                                       authorization_verifier=self.authorization_provider.verify,
-                                       authorization_lease_provider=self.authorization_provider.acquire_lease)
-        self.authorization_provider.issue(authorization)
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from engineering_gate_core.signed_authorization import ReviewerPublicKey, SignedMutationVerdict, DOMAIN_PREFIX, canonical_signed_verdict
+        self.private = Ed25519PrivateKey.generate()
+        public = self.private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        self.store.register_reviewer_key(ReviewerPublicKey("key-1", "reviewer", "provider", public))
+        state = self.store.load("task-1")
+        payload = {"schema_version":1,"signature_algorithm":"Ed25519","key_id":"key-1","review_id":"review-1",
+          "reviewer_id":"reviewer","reviewer_provider":"provider","implementer_id":"implementer","task_id":"task-1",
+          "plan_revision":int(state.revision),"plan_digest":str(state.plan_digest),"proposal_digest":canonical_mutation_proposal_digest(proposal),
+          "verdict":"approve","reviewed_at":now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        encoded = canonical_signed_verdict(payload)
+        verdict = SignedMutationVerdict(encoded, self.private.sign(DOMAIN_PREFIX + encoded))
+        self.authority = GateMutationAuthority(self.store, implementer_id="implementer")
+        self.authorization = self.authority.record_signed_verdict("task-1", verdict)
+        self.service = GateWriteService(self.root, state_store=self.store, mutation_authority=self.authority)
         self.addCleanup(self.service.close)
 
     def _advance_to_approval_request(self):
@@ -110,14 +117,13 @@ class StateStoreGateWriteIntegrationTests(unittest.TestCase):
         return self.service.issue_permit(task_id="task-1", operation=self.operation,
                                          arguments={"content": "approved content"})
 
-    def test_verifier_is_required_for_real_store_write(self):
-        self.service._authorization_verifier = None
-        with self.assertRaises(PermissionError):
-            self._permit()
+    def test_service_constructor_requires_gate_authority(self):
+        with self.assertRaises(TypeError):
+            GateWriteService(self.root)
 
-    def test_provider_revocation_after_permit_issue_denies_real_store_write(self):
+    def test_authority_revocation_after_permit_issue_denies_real_store_write(self):
         permit = self._permit()
-        self.authorization_provider.revoke("auth-1")
+        self.authority.revoke(self.authorization.authorization_id, reason="revoked")
         with self.assertRaises(PermissionError):
             self.service.execute(permit, task_id="task-1", operation=self.operation,
                                  arguments={"content": "approved content"})
@@ -164,14 +170,14 @@ class StateStoreGateWriteIntegrationTests(unittest.TestCase):
         write_finished = threading.Event()
         cancel_finished = threading.Event()
         errors = []
-        real_write = __import__("os").write
+        real_replace = __import__("os").replace
 
-        def paused_write(fd, data):
+        def paused_replace(src, dst, **kwargs):
             entered_write.set()
             if not release_write.wait(3):
-                raise AssertionError("test did not release filesystem write")
+                raise AssertionError("test did not release final replacement")
             try:
-                return real_write(fd, data)
+                return real_replace(src, dst, **kwargs)
             finally:
                 write_finished.set()
 
@@ -190,7 +196,7 @@ class StateStoreGateWriteIntegrationTests(unittest.TestCase):
             finally:
                 cancel_finished.set()
 
-        with patch("engineering_gate_core.a3_execution.os.write", side_effect=paused_write):
+        with patch("engineering_gate_core.a3_execution.os.replace", side_effect=paused_replace):
             writer = threading.Thread(target=execute)
             writer.start()
             self.assertTrue(entered_write.wait(2))

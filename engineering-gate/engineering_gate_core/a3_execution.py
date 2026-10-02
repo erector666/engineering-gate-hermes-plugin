@@ -85,20 +85,18 @@ class GateWriteService:
     releases the reservation. This is a trusted provider contract.
     """
 
-    def __init__(self, root: str | os.PathLike[str], *,
-                 state_loader: Callable[[str], TaskStateRecord],
-                 state_transaction: Callable[[str, Callable[[TaskStateRecord], Any]], Any] | None = None,
-                 authorization_verifier: Callable[[MutationAuthorization, MutationProposal], Any] | None = None,
-                 authorization_lease_provider: Callable[[MutationAuthorization, MutationProposal], AbstractContextManager[Any]] | None = None,
-                 clock: Callable[[], datetime] | None = None) -> None:
-        if not callable(state_loader):
-            raise TypeError("state_loader must be callable")
-        if not callable(state_transaction):
-            raise TypeError("state_transaction must be callable")
-        self._state_loader = state_loader
-        self._state_transaction = state_transaction
-        self._authorization_verifier = authorization_verifier
-        self._authorization_lease_provider = authorization_lease_provider
+    def __init__(self, root: str | os.PathLike[str], *, state_store: Any,
+                 mutation_authority: Any, clock: Callable[[], datetime] | None = None) -> None:
+        from .mutation_authority import GateMutationAuthority
+        from .state_store import StateStore
+        if type(state_store) is not StateStore or type(mutation_authority) is not GateMutationAuthority:
+            raise TypeError("StateStore and GateMutationAuthority are required")
+        if mutation_authority.store is not state_store:
+            raise ValueError("mutation authority must use the identical StateStore")
+        self._state_store = state_store
+        self._mutation_authority = mutation_authority
+        self._state_loader = state_store.load
+        self._state_transaction = state_store.with_current_state_transaction
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._root = Path(root).resolve(strict=True)
         if not self._root.is_dir():
@@ -152,36 +150,24 @@ class GateWriteService:
         return state
 
     def _verified_context(self, state: TaskStateRecord, operation: NormalizedOperation,
-                          arguments: Any, *, require_lease: bool = False) -> tuple[str, str, str, str]:
-        if self._authorization_verifier is None or not callable(self._authorization_verifier):
-            raise PermissionError("provider authorization verifier is required")
+                          arguments: Any, *, authorization_id: str | None = None) -> tuple[str, str, str, str]:
         if not isinstance(arguments, dict) or set(arguments) != {"content"} or type(arguments["content"]) is not str:
             raise PermissionError("write arguments must contain only string content")
-        proposal, authorization = state.mutation_proposal, state.mutation_authorization
-        if type(proposal) is not MutationProposal or type(authorization) is not MutationAuthorization:
-            raise PermissionError("current mutation proposal and authorization are required")
+        proposal = state.mutation_proposal
+        if type(proposal) is not MutationProposal:
+            raise PermissionError("current mutation proposal is required")
         try:
-            now = self._clock()
-            if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
-                raise ValueError("clock must return UTC-aware datetime")
-            record_mutation_authorization(state, authorization, now=now)
-            result = self._authorization_verifier(authorization, proposal)
-            if type(result) is not bool or not result:
-                raise PermissionError("provider authorization was not verified")
             proposal_digest = canonical_mutation_proposal_digest(proposal)
-            auth_digest = hashlib.sha256(json.dumps({k: getattr(authorization, k) for k in
-                ("authorization_id", "task_id", "revision", "plan_digest", "proposal_digest", "authority_id", "authorized_at", "expires_at")},
-                sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            if authorization_id is None:
+                authorization_id = self._mutation_authority.get_active_authorization(state.task_id, proposal).authorization_id
             expected_argument = mutation_argument_digest(arguments["content"])
-        except PermissionError:
-            raise
         except Exception as exc:
             raise PermissionError("mutation authorization context is invalid") from exc
         if (state.state is not TaskState.IMPLEMENTING or proposal.operation != operation
                 or proposal.argument_digest != expected_argument or proposal.task_id != state.task_id
                 or proposal.revision != state.revision or proposal.plan_digest != state.plan_digest):
             raise PermissionError("request does not match reviewed mutation proposal")
-        return str(state.plan_digest), expected_argument, proposal_digest, auth_digest
+        return str(state.plan_digest), expected_argument, proposal_digest, authorization_id
 
     def issue_permit(self, *, task_id: str, operation: NormalizedOperation, arguments: Any) -> WritePermit:
         with self._lock:
@@ -226,12 +212,84 @@ class GateWriteService:
         approved_identity: WorkspaceIdentity | None = None
         detached = False
 
+        staged: dict[str, Any] = {}
+
+        def stage_current(state: TaskStateRecord) -> None:
+            self._authorize(state, operation)
+            _, arg_digest, proposal_digest, _ = self._verified_context(
+                state, operation, arguments, authorization_id=binding.authorization_digest)
+            if _Binding(task_id, int(state.revision), str(state.plan_digest), operation,
+                        operation.target, arg_digest, proposal_digest, binding.authorization_digest) != binding:
+                raise PermissionError("request does not match permit")
+            components = operation.target.split("/")
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            fds = [os.dup(self._root_fd)]
+            temp_name = None
+            try:
+                for component in components[:-1]:
+                    child = os.open(component, flags, dir_fd=fds[-1])
+                    if not stat.S_ISDIR(os.fstat(child).st_mode):
+                        os.close(child)
+                        raise PermissionError("target parent is not a directory")
+                    fds.append(child)
+                parent, name = fds[-1], components[-1]
+                try: existing = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError: existing = None
+                except OSError as exc: raise PermissionError("target cannot be inspected safely") from exc
+                if existing is not None and not stat.S_ISREG(existing.st_mode):
+                    raise PermissionError("target must be a regular file, not a symlink or special file")
+                for _ in range(10):
+                    candidate = f".gate-write-{secrets.token_hex(16)}.tmp"
+                    if candidate == name:
+                        continue
+                    try:
+                        fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent)
+                    except FileExistsError:
+                        continue
+                    temp_name = candidate
+                    break
+                else:
+                    raise FileExistsError("unable to allocate a unique staging file")
+                try:
+                    if existing is not None: os.fchmod(fd, stat.S_IMODE(existing.st_mode))
+                    view = memoryview(arguments["content"].encode("utf-8"))
+                    while view:
+                        n = os.write(fd, view)
+                        if n <= 0: raise OSError("short write")
+                        view = view[n:]
+                finally: os.close(fd)
+                info = os.stat(temp_name, dir_fd=parent, follow_symlinks=False)
+                staged.update(fds=fds, name=name, temp_name=temp_name,
+                              identity=(info.st_dev, info.st_ino), components=components,
+                              edges=[(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in fds])
+                temp_name = None
+                fds = []
+            finally:
+                if temp_name:
+                    try: os.unlink(temp_name, dir_fd=fds[-1])
+                    except FileNotFoundError: pass
+                for fd in reversed(fds): os.close(fd)
+
+        def cleanup_staged() -> None:
+            fds = staged.pop("fds", [])
+            name = staged.pop("temp_name", None)
+            if name and fds:
+                try: os.unlink(name, dir_fd=fds[-1])
+                except FileNotFoundError: pass
+                except OSError as exc:
+                    if exc.errno != 9: raise
+            for fd in reversed(fds):
+                try: os.close(fd)
+                except OSError as exc:
+                    if exc.errno != 9: raise
+
         def execute_current(state: TaskStateRecord) -> ExecutionTransactionResult:
             nonlocal replacement_completed, approved_identity, detached
             if not isinstance(state, TaskStateRecord) or state.task_id != task_id:
                 raise PermissionError("current task state is invalid or belongs to another task")
             current_plan_digest = self._authorize(state, operation)
-            plan_digest, arg_digest, proposal_digest, auth_digest = self._verified_context(state, operation, arguments)
+            plan_digest, arg_digest, proposal_digest, auth_digest = self._verified_context(
+                state, operation, arguments, authorization_id=binding.authorization_digest)
             if current_plan_digest != plan_digest:
                 raise PermissionError("current plan does not match authorization")
             approved_identity = state.plan.workspace_identity if state.plan else None
@@ -242,26 +300,14 @@ class GateWriteService:
             if not isinstance(arguments, dict) or set(arguments) != {"content"} or not isinstance(arguments["content"], str):
                 raise ValueError("write arguments must contain only string content")
 
-            components = operation.target.split("/")
-            required = ("O_DIRECTORY", "O_NOFOLLOW", "supports_dir_fd")
-            if not all(hasattr(os, name) for name in required) or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd or os.rename not in os.supports_dir_fd:
-                raise PermissionError("platform lacks safe descriptor-relative filesystem operations")
+            components = staged["components"]
             directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            temp_name: str | None = None
-            pinned_fds = [os.dup(self._root_fd)]
-            parent_fd = pinned_fds[0]
+            temp_name = staged["temp_name"]
+            pinned_fds = staged["fds"]
+            parent_fd = pinned_fds[-1]
+            name = staged["name"]
+            pinned_edges = staged["edges"]
             try:
-                for component in components[:-1]:
-                    child_fd = os.open(component, directory_flags, dir_fd=pinned_fds[-1])
-                    child_info = os.fstat(child_fd)
-                    if not stat.S_ISDIR(child_info.st_mode):
-                        os.close(child_fd)
-                        raise PermissionError("target parent is not a directory")
-                    pinned_fds.append(child_fd)
-                parent_fd = pinned_fds[-1]
-                name = components[-1]
-                pinned_edges = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in pinned_fds]
-
                 def parent_chain_matches() -> bool:
                     check_fd = os.dup(self._root_fd)
                     try:
@@ -280,59 +326,31 @@ class GateWriteService:
                     finally:
                         os.close(check_fd)
 
-                try:
-                    existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    existing = None
-                except OSError as exc:
-                    raise PermissionError("target cannot be inspected safely") from exc
+                try: existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError: existing = None
+                except OSError as exc: raise PermissionError("target cannot be inspected safely") from exc
                 if existing is not None and not stat.S_ISREG(existing.st_mode):
                     raise PermissionError("target must be a regular file, not a symlink or special file")
-                temp_name = f".gate-write-{secrets.token_hex(16)}.tmp"
-                while temp_name == name:
-                    temp_name = f".gate-write-{secrets.token_hex(16)}.tmp"
-                fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent_fd)
-                try:
-                    if existing is not None:
-                        os.fchmod(fd, stat.S_IMODE(existing.st_mode))
-                    view = memoryview(arguments["content"].encode("utf-8"))
-                    while view:
-                        written = os.write(fd, view)
-                        if written <= 0:
-                            raise OSError("short write")
-                        view = view[written:]
-                finally:
-                    os.close(fd)
-                staged_info = os.stat(temp_name, dir_fd=parent_fd, follow_symlinks=False)
-                staged_identity = (staged_info.st_dev, staged_info.st_ino)
-                # Provider authority can be revoked while the file is staged.
-                _, latest_arg_digest, latest_proposal_digest, latest_auth_digest = self._verified_context(
-                    state, operation, arguments)
+                staged_identity = staged["identity"]
+                if state.mutation_proposal is None:
+                    raise PermissionError("current mutation proposal is unavailable")
+                latest_arg_digest = mutation_argument_digest(arguments["content"])
+                latest_proposal_digest = canonical_mutation_proposal_digest(state.mutation_proposal)
                 latest = _Binding(task_id, int(state.revision), str(state.plan_digest), operation,
                                   operation.target, latest_arg_digest, latest_proposal_digest,
-                                  latest_auth_digest)
+                                  binding.authorization_digest)
                 if latest != binding:
                     raise PermissionError("authorization changed before filesystem mutation")
-                lease_provider = self._authorization_lease_provider
-                if not callable(lease_provider):
-                    raise PermissionError("provider authorization lease is required")
+                self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
+                if not parent_chain_matches():
+                    raise WorkspacePathDetached("workspace parent path detached before replacement")
+                active_lease.mark_replacement_attempted()
                 try:
-                    lease = lease_provider(state.mutation_authorization, state.mutation_proposal)
-                    if not hasattr(lease, "__enter__") or not hasattr(lease, "__exit__"):
-                        raise TypeError("authorization lease must be a context manager")
-                    with lease:
-                        self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
-                        if not parent_chain_matches():
-                            raise WorkspacePathDetached("workspace parent path detached before replacement")
-                        os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                        replacement_completed = True
-                except PermissionError:
+                    os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                except Exception:
                     raise
-                except WorkspacePathDetached:
-                    raise
-                except Exception as exc:
-                    raise PermissionError("provider authorization lease could not be acquired") from exc
                 replacement_completed = True
+                temp_name = None
                 temp_name = None
                 try:
                     self._validate_workspace_identity(state.plan.workspace_identity if state.plan else None)
@@ -374,17 +392,11 @@ class GateWriteService:
                     if observed_fd is not None:
                         os.close(observed_fd)
             finally:
-                if temp_name is not None:
-                    try:
-                        os.unlink(temp_name, dir_fd=parent_fd)
-                    except FileNotFoundError:
-                        pass
-                for pinned_fd in reversed(pinned_fds):
-                    os.close(pinned_fd)
+                pass
             audit = ExecutionAuditRecord(
                 audit_id=str(uuid4()), task_id=state.task_id, revision=state.revision,
                 plan_digest=str(state.plan_digest), proposal_digest=proposal_digest,
-                authorization_id=state.mutation_authorization.authorization_id,
+                authorization_id=binding.authorization_digest,
                 permit_hash=hashlib.sha256(permit._nonce.encode("utf-8")).hexdigest(),
                 operation_kind=operation.kind, target=operation.target, argument_digest=arg_digest,
                 workspace_identity=state.plan.workspace_identity,
@@ -396,8 +408,31 @@ class GateWriteService:
             return ExecutionTransactionResult(audit, detached)
 
         try:
-            outcome = self._state_transaction(task_id, execute_current)
+            current = self._state_loader(task_id)
+            if not isinstance(current, TaskStateRecord) or current.task_id != task_id:
+                raise PermissionError("current task state is invalid or belongs to another task")
+            self._authorize(current, operation)
+            _, current_argument_digest, current_proposal_digest, current_authorization_id = self._verified_context(
+                current, operation, arguments)
+            if (current_authorization_id != binding.authorization_digest
+                    or current_argument_digest != binding.argument_digest
+                    or current_proposal_digest != binding.proposal_digest
+                    or current.revision != binding.revision
+                    or current.plan_digest != binding.plan_digest):
+                raise PermissionError("execution request does not match permit authorization")
+            stage_current(current)
+            with self._mutation_authority.acquire_write_lease(
+                    task_id, binding.authorization_digest, current.mutation_proposal) as active_lease:
+                outcome = self._state_transaction(task_id, execute_current)
+                if (isinstance(outcome, ExecutionTransactionResult)
+                        and outcome.audit_record.outcome is ExecutionOutcome.SUCCEEDED
+                        and not outcome.path_detached):
+                    active_lease.complete()
+                else:
+                    active_lease.finalize("uncertain")
+            cleanup_staged()
         except Exception as exc:
+            cleanup_staged()
             with self._lock:
                 self._reserved_permits.discard(permit._nonce)
                 if replacement_completed:
@@ -406,7 +441,9 @@ class GateWriteService:
                 raise MutationOutcomeUnknown(
                     "the write may have completed; inspect the target before retrying"
                 ) from exc
-            raise
+            if isinstance(exc, PermissionError):
+                raise
+            raise PermissionError("write authorization or execution failed") from exc
         with self._lock:
             self._reserved_permits.discard(permit._nonce)
             self._permits.pop(permit._nonce, None)

@@ -11,12 +11,14 @@ import sqlite3
 import tempfile
 import types
 import typing
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from . import models
 from .models import ApprovalReceipt, MutationAuthorization, MutationProposal, TaskID, TaskStateRecord
 from .workflow import Event, TransitionError, canonical_mutation_proposal_digest, canonical_plan_digest, new_task, record_approval, _record_gate_observed_verification, record_mutation_authorization, record_mutation_proposal, capture_workspace_identity, transition
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _DATACLASSES = {name: value for name, value in vars(models).items()
                 if isinstance(value, type) and is_dataclass(value)}
 _ENUMS = {name: value for name, value in vars(models).items()
@@ -163,7 +165,8 @@ def _decode(value, *, allow_legacy_missing=False):
         missing = expected - actual
         allowed = (({"mutation_proposal", "mutation_authorization"} if name == "TaskStateRecord" else
                     {"workspace_identity", "verification_commands"} if name == "Plan" else
-                    {"provenance"} if name == "Evidence" else set()) if allow_legacy_missing else set())
+                    {"provenance"} if name == "Evidence" else
+                    {"execution_id"} if name == "ObservedCommandEvidence" else set()) if allow_legacy_missing else set())
         if actual - expected or missing - allowed:
             raise StateStoreError("record fields do not match schema")
         try:
@@ -224,6 +227,38 @@ class StateStore:
         self.path = Path(os.path.abspath(Path(path)))
         _ensure_private_parent(self.path.parent)
         _prepare_database(self.path)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now = self._utc_stamp(datetime.now(timezone.utc))
+            previous = connection.execute("SELECT value FROM metadata WHERE key='authorization_clock_high_watermark'").fetchone()
+            if previous is not None and now < previous[0]:
+                raise StateStoreError("UTC clock moved backwards")
+            connection.execute("INSERT INTO metadata(key,value) VALUES('authorization_clock_high_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+            reserved = connection.execute("SELECT authorization_id,key_id FROM mutation_leases WHERE status='RESERVED'").fetchall()
+            connection.execute("UPDATE mutation_leases SET status='CONSUMED_UNCERTAIN',reservation_id=NULL WHERE status='RESERVED'")
+            connection.execute("UPDATE mutation_leases SET status='EXPIRED' WHERE status='ACTIVE' AND expires_at<=?", (now,))
+            for authorization_id, key_id in reserved:
+                self._append_authorization_event(connection, "CONSUMED_UNCERTAIN", authorization_id, key_id, "recovered after restart", now)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _utc_stamp(value):
+        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise StateStoreError("timestamp must be UTC-aware")
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _parse_utc(value):
+        try:
+            return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError("stored authorization timestamp is malformed") from exc
 
     def _connect(self):
         connection = sqlite3.connect(str(self.path), timeout=5.0, isolation_level=None)
@@ -239,6 +274,7 @@ class StateStore:
                 connection.execute("INSERT INTO metadata(key,value) VALUES('schema_version',?)", (str(_SCHEMA_VERSION),))
                 connection.execute("CREATE TABLE task_state (task_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
                 self._create_audit_schema(connection)
+                self._create_authorization_schema(connection)
             else:
                 if "metadata" not in tables:
                     raise StateStoreError("database schema metadata is missing")
@@ -246,7 +282,7 @@ class StateStore:
                 if not {"key", "value"}.issubset(metadata_columns):
                     raise StateStoreError("database schema metadata is malformed")
                 rows = connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchall()
-                if len(rows) != 1 or type(rows[0][0]) is not str or rows[0][0] not in ("1", "2", "3", str(_SCHEMA_VERSION)):
+                if len(rows) != 1 or type(rows[0][0]) is not str or rows[0][0] not in ("1", "2", "3", "4", str(_SCHEMA_VERSION)):
                     raise StateStoreError("missing, malformed, or unsupported database schema version")
                 if "task_state" not in tables:
                     raise StateStoreError("database task state table is missing")
@@ -269,11 +305,13 @@ class StateStore:
                     self._migrate_v2(connection)
                 if rows[0][0] in ("1", "2", "3"):
                     self._migrate_v3(connection)
+                if rows[0][0] in ("1", "2", "3", "4"):
+                    self._migrate_v4(connection)
                 self._validate_audit_schema(connection)
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )}
-            if tables != {"metadata", "task_state", "execution_audit"}:
+            if tables != {"metadata", "task_state", "execution_audit", "reviewer_keys", "signed_verdicts", "mutation_leases", "authorization_audit"}:
                 raise StateStoreError("database schema contains missing or unexpected tables")
             metadata_info = connection.execute("PRAGMA table_xinfo(metadata)").fetchall()
             metadata_schema = [(r[1], r[2].upper(), r[3], r[5], r[6]) for r in metadata_info]
@@ -284,6 +322,7 @@ class StateStore:
             if "keytextprimarykey" not in metadata_sql or "valuetextnotnull" not in metadata_sql or "task_idtextprimarykey" not in task_sql or "payloadtextnotnull" not in task_sql:
                 raise StateStoreError("database table DDL is malformed")
             self._validate_audit_schema(connection)
+            self._validate_authorization_schema(connection)
             connection.commit()
             return connection
         except BaseException:
@@ -368,6 +407,99 @@ class StateStore:
         }
         if triggers != expected_triggers:
             raise StateStoreError("execution audit immutability triggers are malformed")
+
+    @staticmethod
+    def _create_authorization_schema(connection):
+        connection.execute("""CREATE TABLE IF NOT EXISTS reviewer_keys (
+            key_id TEXT PRIMARY KEY, reviewer_id TEXT NOT NULL, reviewer_provider TEXT NOT NULL,
+            public_key BLOB NOT NULL CHECK(length(public_key)=32), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+            revoked INTEGER NOT NULL CHECK(revoked IN (0,1)), registered_at TEXT NOT NULL)""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS signed_verdicts (
+            review_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL,
+            key_id TEXT NOT NULL REFERENCES reviewer_keys(key_id), canonical_payload BLOB NOT NULL,
+            signature BLOB NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approve','reject')),
+            reviewer_id TEXT NOT NULL, reviewer_provider TEXT NOT NULL, implementer_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL, plan_digest TEXT NOT NULL, proposal_digest TEXT NOT NULL,
+            reviewed_at TEXT NOT NULL, recorded_at TEXT NOT NULL)""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS mutation_leases (
+            authorization_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE REFERENCES signed_verdicts(review_id),
+            task_id TEXT NOT NULL, plan_revision INTEGER NOT NULL, plan_digest TEXT NOT NULL, proposal_digest TEXT NOT NULL,
+            reviewer_id TEXT NOT NULL, reviewer_provider TEXT NOT NULL, implementer_id TEXT NOT NULL,
+            key_id TEXT NOT NULL REFERENCES reviewer_keys(key_id), reviewed_at TEXT NOT NULL, issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('ACTIVE','RESERVED','CONSUMED','CONSUMED_UNCERTAIN','REVOKED','EXPIRED')),
+            reservation_id TEXT UNIQUE, payload_digest TEXT NOT NULL UNIQUE,
+            CHECK((status='RESERVED' AND reservation_id IS NOT NULL) OR (status!='RESERVED' AND reservation_id IS NULL)))""")
+        connection.execute("CREATE INDEX IF NOT EXISTS mutation_leases_task_idx ON mutation_leases(task_id,status)")
+        connection.execute("""CREATE TABLE IF NOT EXISTS authorization_audit (
+            event_id TEXT PRIMARY KEY, authorization_id TEXT, key_id TEXT, event TEXT NOT NULL,
+            reason TEXT NOT NULL, occurred_at TEXT NOT NULL)""")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS signed_verdicts_no_update BEFORE UPDATE ON signed_verdicts BEGIN SELECT RAISE(ABORT,'append-only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS signed_verdicts_no_delete BEFORE DELETE ON signed_verdicts BEGIN SELECT RAISE(ABORT,'append-only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS authorization_audit_no_update BEFORE UPDATE ON authorization_audit BEGIN SELECT RAISE(ABORT,'append-only'); END")
+        connection.execute("CREATE TRIGGER IF NOT EXISTS authorization_audit_no_delete BEFORE DELETE ON authorization_audit BEGIN SELECT RAISE(ABORT,'append-only'); END")
+
+    @staticmethod
+    def _validate_authorization_schema(connection):
+        expected = {"reviewer_keys", "signed_verdicts", "mutation_leases", "authorization_audit"}
+        rows = connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('reviewer_keys','signed_verdicts','mutation_leases','authorization_audit')").fetchall()
+        if {r[0] for r in rows} != expected or any(not r[1] for r in rows):
+            raise StateStoreError("authorization schema is missing or malformed")
+        expected_columns = {
+            "reviewer_keys": [("key_id", "TEXT", 0, 1, 0), ("reviewer_id", "TEXT", 1, 0, 0),
+                ("reviewer_provider", "TEXT", 1, 0, 0), ("public_key", "BLOB", 1, 0, 0),
+                ("enabled", "INTEGER", 1, 0, 0), ("revoked", "INTEGER", 1, 0, 0),
+                ("registered_at", "TEXT", 1, 0, 0)],
+            "signed_verdicts": [("review_id", "TEXT", 0, 1, 0), ("payload_digest", "TEXT", 1, 0, 0),
+                ("task_id", "TEXT", 1, 0, 0), ("key_id", "TEXT", 1, 0, 0),
+                ("canonical_payload", "BLOB", 1, 0, 0), ("signature", "BLOB", 1, 0, 0),
+                ("verdict", "TEXT", 1, 0, 0), ("reviewer_id", "TEXT", 1, 0, 0),
+                ("reviewer_provider", "TEXT", 1, 0, 0), ("implementer_id", "TEXT", 1, 0, 0),
+                ("plan_revision", "INTEGER", 1, 0, 0), ("plan_digest", "TEXT", 1, 0, 0),
+                ("proposal_digest", "TEXT", 1, 0, 0), ("reviewed_at", "TEXT", 1, 0, 0),
+                ("recorded_at", "TEXT", 1, 0, 0)],
+            "mutation_leases": [("authorization_id", "TEXT", 0, 1, 0), ("review_id", "TEXT", 1, 0, 0),
+                ("task_id", "TEXT", 1, 0, 0), ("plan_revision", "INTEGER", 1, 0, 0),
+                ("plan_digest", "TEXT", 1, 0, 0), ("proposal_digest", "TEXT", 1, 0, 0),
+                ("reviewer_id", "TEXT", 1, 0, 0), ("reviewer_provider", "TEXT", 1, 0, 0),
+                ("implementer_id", "TEXT", 1, 0, 0), ("key_id", "TEXT", 1, 0, 0),
+                ("reviewed_at", "TEXT", 1, 0, 0), ("issued_at", "TEXT", 1, 0, 0),
+                ("expires_at", "TEXT", 1, 0, 0), ("status", "TEXT", 1, 0, 0),
+                ("reservation_id", "TEXT", 0, 0, 0), ("payload_digest", "TEXT", 1, 0, 0)],
+            "authorization_audit": [("event_id", "TEXT", 0, 1, 0), ("authorization_id", "TEXT", 0, 0, 0),
+                ("key_id", "TEXT", 0, 0, 0), ("event", "TEXT", 1, 0, 0),
+                ("reason", "TEXT", 1, 0, 0), ("occurred_at", "TEXT", 1, 0, 0)]}
+        for table, expected_shape in expected_columns.items():
+            columns = connection.execute(f"PRAGMA table_xinfo({table})").fetchall()
+            shape = [(row[1], row[2].upper(), row[3], row[5], row[6]) for row in columns]
+            if any(len(row) != 7 for row in columns) or shape != expected_shape:
+                raise StateStoreError("authorization table columns are malformed")
+        sql_by_table = {name: StateStore._normalize_schema_sql(sql).replace(" ", "") for name, sql in rows}
+        constraints = {
+            "reviewer_keys": ("check(length(public_key)=32)", "check(enabledin(0,1))", "check(revokedin(0,1))"),
+            "signed_verdicts": ("unique", "check(verdictin('approve','reject'))", "referencesreviewer_keys(key_id)"),
+            "mutation_leases": ("unique", "check(statusin('active','reserved','consumed','consumed_uncertain','revoked','expired'))",
+                "references signed_verdicts(review_id)".replace(" ", ""), "referencesreviewer_keys(key_id)",
+                "check((status='reserved'andreservation_idisnotnull)or(status!='reserved'andreservation_idisnull))"),
+            "authorization_audit": ()}
+        for table, fragments in constraints.items():
+            if any(fragment not in sql_by_table[table] for fragment in fragments):
+                raise StateStoreError("authorization table constraints are malformed")
+        expected_triggers = {
+            "signed_verdicts_no_update": "create trigger signed_verdicts_no_update before update on signed_verdicts begin select raise(abort,'append-only'); end",
+            "signed_verdicts_no_delete": "create trigger signed_verdicts_no_delete before delete on signed_verdicts begin select raise(abort,'append-only'); end",
+            "authorization_audit_no_update": "create trigger authorization_audit_no_update before update on authorization_audit begin select raise(abort,'append-only'); end",
+            "authorization_audit_no_delete": "create trigger authorization_audit_no_delete before delete on authorization_audit begin select raise(abort,'append-only'); end"}
+        actual_triggers = {name: StateStore._normalize_schema_sql(sql) for name, sql in connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('signed_verdicts','authorization_audit')")}
+        if actual_triggers != expected_triggers:
+            raise StateStoreError("authorization audit immutability triggers are malformed")
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(mutation_leases)")}
+        if "mutation_leases_task_idx" not in indexes:
+            raise StateStoreError("authorization lookup index is missing")
+
+    @classmethod
+    def _migrate_v4(cls, connection):
+        cls._create_authorization_schema(connection)
+        connection.execute("UPDATE metadata SET value='5' WHERE key='schema_version'")
 
     @staticmethod
     def _normalize_schema_sql(sql):
@@ -497,6 +629,273 @@ class StateStore:
                     mutation_proposal=None, mutation_authorization=None)
         return record
 
+    def register_reviewer_key(self, key_record):
+        from .signed_authorization import ReviewerPublicKey
+        if type(key_record) is not ReviewerPublicKey or not key_record.key_id or len(key_record.key_id) > 256:
+            raise StateStoreError("invalid reviewer key record")
+        if type(key_record.public_key) is not bytes or len(key_record.public_key) != 32:
+            raise StateStoreError("reviewer public key must be 32 bytes")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO reviewer_keys VALUES(?,?,?,?,?,?,?)", (
+                key_record.key_id, key_record.reviewer_id, key_record.reviewer_provider,
+                key_record.public_key, int(key_record.enabled), int(key_record.revoked),
+                self._utc_stamp(datetime.now(timezone.utc))))
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise StateStoreError("reviewer key ID already registered") from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_reviewer_key(self, key_id):
+        from .signed_authorization import ReviewerPublicKey
+        connection = self._connect()
+        try:
+            row = connection.execute("SELECT key_id,reviewer_id,reviewer_provider,public_key,enabled,revoked FROM reviewer_keys WHERE key_id=?", (key_id,)).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise StateStoreError("reviewer key not found")
+        return ReviewerPublicKey(row[0], row[1], row[2], bytes(row[3]), bool(row[4]), bool(row[5]))
+
+    def revoke_reviewer_key(self, key_id, *, reason):
+        if type(reason) is not str or not reason.strip() or len(reason) > 512:
+            raise StateStoreError("revocation reason is required and bounded")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now = self._utc_stamp(datetime.now(timezone.utc))
+            changed = connection.execute("UPDATE reviewer_keys SET enabled=0,revoked=1 WHERE key_id=? AND revoked=0", (key_id,)).rowcount
+            if not changed:
+                raise StateStoreError("reviewer key not found or already revoked")
+            leases = connection.execute("SELECT authorization_id FROM mutation_leases WHERE key_id=? AND status='ACTIVE'", (key_id,)).fetchall()
+            connection.execute("UPDATE mutation_leases SET status='REVOKED' WHERE key_id=? AND status='ACTIVE'", (key_id,))
+            for (auth_id,) in leases:
+                self._append_authorization_event(connection, "KEY_REVOKED", auth_id, key_id, reason, now)
+            self._append_authorization_event(connection, "KEY_REVOKED", None, key_id, reason, now)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _append_authorization_event(connection, event, authorization_id, key_id, reason, now):
+        connection.execute("INSERT INTO authorization_audit VALUES(?,?,?,?,?,?)",
+            (uuid4().hex, authorization_id, key_id, event, reason, now))
+
+    def list_authorization_audit(self, *, authorization_id=None, key_id=None):
+        connection = self._connect()
+        try:
+            clauses = []
+            parameters = []
+            if authorization_id is not None:
+                clauses.append("authorization_id=?")
+                parameters.append(authorization_id)
+            if key_id is not None:
+                clauses.append("key_id=?")
+                parameters.append(key_id)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            return tuple(connection.execute(
+                "SELECT event_id,authorization_id,key_id,event,reason,occurred_at FROM authorization_audit" + where + " ORDER BY rowid",
+                parameters).fetchall())
+        finally:
+            connection.close()
+
+    def _record_verified_verdict(self, task_id, verified, signed_payload, signature, *, authorization_id, issued_at, expires_at):
+        from .signed_authorization import VerifiedReviewerVerdict
+        if type(verified) is not VerifiedReviewerVerdict or verified.task_id != str(task_id):
+            raise StateStoreError("verified verdict task binding is invalid")
+        if type(signed_payload) is not bytes or type(signature) is not bytes:
+            raise StateStoreError("signed verdict bytes are required")
+        approved = verified.verdict == "approve"
+        if approved != (authorization_id is not None and issued_at is not None and expires_at is not None):
+            raise StateStoreError("lease timestamps and ID must be present only for approvals")
+        issued_text = self._utc_stamp(issued_at) if approved else None
+        expiry_text = self._utc_stamp(expires_at) if approved else None
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            key = connection.execute("SELECT reviewer_id,reviewer_provider,enabled,revoked FROM reviewer_keys WHERE key_id=?", (verified.key_id,)).fetchone()
+            if key is None or key[:2] != (verified.reviewer_id, verified.reviewer_provider) or key[2:] != (1, 0):
+                raise StateStoreError("reviewer key is not currently trusted")
+            if verified.reviewed_at.tzinfo is None or verified.reviewed_at.utcoffset() != timezone.utc.utcoffset(verified.reviewed_at):
+                raise StateStoreError("reviewed_at must be UTC-aware")
+            reviewed_text = self._utc_stamp(verified.reviewed_at)
+            now_dt = datetime.now(timezone.utc)
+            now = self._utc_stamp(now_dt)
+            previous = connection.execute("SELECT value FROM metadata WHERE key='authorization_clock_high_watermark'").fetchone()
+            if previous is not None and now < previous[0]:
+                raise StateStoreError("UTC clock moved backwards")
+            connection.execute("INSERT INTO metadata(key,value) VALUES('authorization_clock_high_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+            if approved:
+                assert issued_at is not None and expires_at is not None
+                if (issued_at > now_dt or expires_at - issued_at > timedelta(seconds=300)
+                        or issued_at - verified.reviewed_at > timedelta(seconds=300)
+                        or verified.reviewed_at > issued_at):
+                    raise StateStoreError("authorization issue/expiry window is invalid")
+            connection.execute("INSERT INTO signed_verdicts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                verified.review_id, verified.payload_digest, str(task_id), verified.key_id, signed_payload, signature,
+                verified.verdict, verified.reviewer_id, verified.reviewer_provider, verified.implementer_id,
+                verified.plan_revision, verified.plan_digest, verified.proposal_digest, reviewed_text, now))
+            lease = None
+            if approved:
+                if issued_at <= datetime.now(timezone.utc) - __import__('datetime').timedelta(seconds=300) or expires_at <= issued_at:
+                    raise StateStoreError("authorization issue/expiry window is invalid")
+                connection.execute("INSERT INTO mutation_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE',NULL,?)", (
+                    authorization_id, verified.review_id, str(task_id), verified.plan_revision, verified.plan_digest,
+                    verified.proposal_digest, verified.reviewer_id, verified.reviewer_provider, verified.implementer_id,
+                    verified.key_id, reviewed_text, issued_text, expiry_text, verified.payload_digest))
+                lease = self._lease_from_row(connection.execute("SELECT * FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone())
+                self._append_authorization_event(connection, "ISSUED", authorization_id, verified.key_id, "signed approval", now)
+            else:
+                self._append_authorization_event(connection, "REVIEW_REJECTED", None, verified.key_id, "signed rejection", now)
+            connection.commit()
+            return lease
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise StateStoreError("review or authorization replay/duplicate rejected") from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _lease_from_row(row):
+        if row is None:
+            raise StateStoreError("authorization not found")
+        try:
+            return models.MutationLeaseRecord(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9],
+                StateStore._parse_utc(row[10]), StateStore._parse_utc(row[11]), StateStore._parse_utc(row[12]),
+                models.AuthorizationLeaseStatus(row[13]), row[14], row[15])
+        except (ValueError, TypeError, IndexError) as exc:
+            raise StateStoreError("stored authorization record is corrupt") from exc
+
+    def get_authorization(self, authorization_id):
+        connection = self._connect()
+        try:
+            return self._lease_from_row(connection.execute("SELECT * FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone())
+        finally:
+            connection.close()
+
+    def get_active_authorization(self, task_id, proposal_digest):
+        connection = self._connect()
+        try:
+            row = connection.execute("SELECT * FROM mutation_leases WHERE task_id=? AND proposal_digest=? AND status='ACTIVE'", (str(task_id), proposal_digest)).fetchone()
+        finally:
+            connection.close()
+        if row is None or row[13] != "ACTIVE" or self._parse_utc(row[12]) <= datetime.now(timezone.utc):
+            raise StateStoreError("no current ACTIVE authorization for task/proposal")
+        return self._lease_from_row(row)
+
+    def list_signed_verdicts(self, task_id):
+        connection = self._connect()
+        try:
+            return tuple(connection.execute("SELECT review_id,payload_digest,verdict,key_id,recorded_at FROM signed_verdicts WHERE task_id=? ORDER BY rowid", (str(task_id),)).fetchall())
+        finally:
+            connection.close()
+
+    def reserve_mutation_lease(self, task_id, authorization_id, expected_proposal_digest, now):
+        now_text = self._utc_stamp(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute("SELECT value FROM metadata WHERE key='authorization_clock_high_watermark'").fetchone()
+            if previous is not None and now_text < previous[0]:
+                raise StateStoreError("UTC clock moved backwards")
+            connection.execute("INSERT INTO metadata(key,value) VALUES('authorization_clock_high_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now_text,))
+            row = connection.execute("SELECT * FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone()
+            lease = self._lease_from_row(row)
+            if lease.status is models.AuthorizationLeaseStatus.ACTIVE and now_text >= self._utc_stamp(lease.expires_at):
+                connection.execute("UPDATE mutation_leases SET status='EXPIRED' WHERE authorization_id=? AND status='ACTIVE'", (authorization_id,))
+                self._append_authorization_event(connection, "EXPIRED", authorization_id, lease.key_id, "authorization expired before reservation", now_text)
+                connection.commit()
+                raise StateStoreError("authorization lease expired before reservation")
+            key = connection.execute("SELECT reviewer_id,reviewer_provider,public_key,enabled,revoked FROM reviewer_keys WHERE key_id=?", (lease.key_id,)).fetchone()
+            verdict_row = connection.execute("SELECT canonical_payload,signature FROM signed_verdicts WHERE review_id=?", (lease.review_id,)).fetchone()
+            if (lease.task_id != str(task_id) or lease.proposal_digest != expected_proposal_digest
+                    or lease.status is not models.AuthorizationLeaseStatus.ACTIVE or now_text >= self._utc_stamp(lease.expires_at)
+                    or key is None or key[0] != lease.reviewer_id or key[1] != lease.reviewer_provider or key[3:] != (1, 0)):
+                raise StateStoreError("authorization lease is not reservable")
+            from .signed_authorization import ReviewerPublicKey, SignedMutationVerdict, verify_signed_verdict
+            try:
+                verified_signature = verify_signed_verdict(SignedMutationVerdict(bytes(verdict_row[0]), bytes(verdict_row[1])),
+                    ReviewerPublicKey(lease.key_id, key[0], key[1], bytes(key[2]), bool(key[3]), bool(key[4])),
+                    now=now, implementer_id=lease.implementer_id, max_review_age_seconds=300)
+                if (verified_signature.review_id != lease.review_id or verified_signature.task_id != lease.task_id
+                        or verified_signature.plan_revision != lease.plan_revision
+                        or verified_signature.plan_digest != lease.plan_digest
+                        or verified_signature.proposal_digest != lease.proposal_digest
+                        or verified_signature.reviewer_id != lease.reviewer_id
+                        or verified_signature.reviewer_provider != lease.reviewer_provider
+                        or verified_signature.implementer_id != lease.implementer_id
+                        or verified_signature.key_id != lease.key_id
+                        or verified_signature.payload_digest != lease.payload_digest
+                        or verified_signature.verdict != "approve"
+                        or verified_signature.reviewed_at != lease.reviewed_at):
+                    raise StateStoreError("persisted verdict does not match lease bindings")
+            except Exception as exc:
+                raise StateStoreError("persisted reviewer signature no longer verifies") from exc
+            reservation = uuid4().hex
+            changed = connection.execute("UPDATE mutation_leases SET status='RESERVED',reservation_id=? WHERE authorization_id=? AND status='ACTIVE'", (reservation, authorization_id)).rowcount
+            if changed != 1:
+                raise StateStoreError("authorization reservation raced")
+            self._append_authorization_event(connection, "RESERVED", authorization_id, lease.key_id, "write reservation", now_text)
+            reserved = self._lease_from_row(connection.execute("SELECT * FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone())
+            connection.commit()
+            return reserved
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_mutation_lease(self, authorization_id, reservation_id, *, outcome):
+        if outcome not in ("completed", "failed", "uncertain"):
+            raise StateStoreError("invalid lease outcome")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            status = "CONSUMED_UNCERTAIN" if outcome == "uncertain" else "CONSUMED"
+            changed = connection.execute("UPDATE mutation_leases SET status=?,reservation_id=NULL WHERE authorization_id=? AND reservation_id=? AND status='RESERVED'", (status, authorization_id, reservation_id)).rowcount
+            if changed != 1:
+                raise StateStoreError("reservation not found or already finalized")
+            row = connection.execute("SELECT key_id FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone()
+            self._append_authorization_event(connection, status, authorization_id, row[0], outcome, self._utc_stamp(datetime.now(timezone.utc)))
+            result = self._lease_from_row(connection.execute("SELECT * FROM mutation_leases WHERE authorization_id=?", (authorization_id,)).fetchone())
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def revoke_mutation_authorization(self, authorization_id, *, reason):
+        if type(reason) is not str or not reason.strip() or len(reason) > 512:
+            raise StateStoreError("revocation reason is required and bounded")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT key_id FROM mutation_leases WHERE authorization_id=? AND status='ACTIVE'", (authorization_id,)).fetchone()
+            if row is None:
+                raise StateStoreError("only an ACTIVE authorization may be revoked")
+            connection.execute("UPDATE mutation_leases SET status='REVOKED' WHERE authorization_id=?", (authorization_id,))
+            self._append_authorization_event(connection, "REVOKED", authorization_id, row[0], reason, self._utc_stamp(datetime.now(timezone.utc)))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def create(self, state: TaskStateRecord) -> None:
         if not isinstance(state, TaskStateRecord):
             raise TypeError("state must be TaskStateRecord")
@@ -545,7 +944,9 @@ class StateStore:
             if type(result) is models.ExecutionTransactionResult:
                 audit = result.audit_record
                 auth, proposal, plan = current.mutation_authorization, current.mutation_proposal, current.plan
-                if (auth is None or proposal is None or plan is None or current.permit is None
+                lease_row = connection.execute("SELECT task_id,plan_revision,plan_digest,proposal_digest,status FROM mutation_leases WHERE authorization_id=?", (audit.authorization_id,)).fetchone()
+                if (proposal is None or plan is None or current.permit is None or lease_row is None
+                        or lease_row[4] != 'RESERVED' or lease_row[:4] != (str(current.task_id), int(current.revision), str(current.plan_digest), audit.proposal_digest)
                         or audit.task_id != current.task_id or audit.revision != current.revision
                         or audit.plan_digest != current.plan_digest or audit.plan_digest != canonical_plan_digest(plan)
                         or current.permit.task_id != current.task_id or current.permit.revision != current.revision
@@ -553,11 +954,7 @@ class StateStore:
                         or proposal.operation not in current.permit.scope.operations
                         or proposal.task_id != current.task_id or proposal.revision != current.revision
                         or proposal.plan_digest != current.plan_digest
-                        or auth.task_id != current.task_id or auth.revision != current.revision
-                        or auth.plan_digest != current.plan_digest
-                        or audit.proposal_digest != auth.proposal_digest
                         or audit.proposal_digest != canonical_mutation_proposal_digest(proposal)
-                        or audit.authorization_id != auth.authorization_id
                         or audit.workspace_identity != plan.workspace_identity
                         or audit.operation_kind is not proposal.operation.kind
                         or proposal.operation not in plan.operations
@@ -648,6 +1045,13 @@ class StateStore:
     def record_mutation_authorization(self, task_id: TaskID | str, authorization: MutationAuthorization, *, now=None) -> TaskStateRecord:
         return self._record_mutation(task_id, lambda current: record_mutation_authorization(current, authorization, now=now))
 
+    def _revoke_active_for_task(self, connection, task_id, reason):
+        rows = connection.execute("SELECT authorization_id,key_id FROM mutation_leases WHERE task_id=? AND status='ACTIVE'", (task_id,)).fetchall()
+        now = self._utc_stamp(datetime.now(timezone.utc))
+        connection.execute("UPDATE mutation_leases SET status='REVOKED' WHERE task_id=? AND status='ACTIVE'", (task_id,))
+        for authorization_id, key_id in rows:
+            self._append_authorization_event(connection, "REVOKED", authorization_id, key_id, reason, now)
+
     def _record_mutation(self, task_id, apply):
         connection = self._connect()
         try:
@@ -659,6 +1063,9 @@ class StateStore:
             if str(current.task_id) != str(task_id):
                 raise StateStoreError("task ID does not match stored key")
             updated = apply(current)
+            if (updated.revision != current.revision or updated.plan_digest != current.plan_digest
+                    or updated.mutation_proposal != current.mutation_proposal):
+                self._revoke_active_for_task(connection, str(task_id), "plan or proposal changed")
             connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(updated), str(task_id)))
             connection.commit()
             return updated
@@ -679,6 +1086,9 @@ class StateStore:
             if str(current.task_id) != str(task_id):
                 raise StateStoreError("task ID does not match stored key")
             updated = transition(current, event, artifact)
+            if (updated.revision != current.revision or updated.plan_digest != current.plan_digest
+                    or updated.mutation_proposal != current.mutation_proposal):
+                self._revoke_active_for_task(connection, str(task_id), "plan or proposal changed")
             connection.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(updated), str(task_id)))
             connection.commit()
             return updated
