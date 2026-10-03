@@ -14,7 +14,7 @@ from engineering_gate_core.models import (AcceptanceCriterion, ApprovalRequest, 
 from engineering_gate_core.state_store import StateStore
 from engineering_gate_core.workflow import Event, capture_workspace_identity, new_task
 
-PACKET_KEYS = {"task_objective", "inspection_evidence", "analysis", "plan", "blast_radius", "plan_review", "plan_revision", "plan_digest", "workspace_identity", "approval_request_id", "profile_id"}
+PACKET_KEYS = {"task_id", "task_objective", "inspection_evidence", "analysis", "plan", "blast_radius", "plan_review", "plan_revision", "plan_digest", "workspace_identity", "approval_request_id", "profile_id"}
 
 
 def make_approval_state(tmp_path):
@@ -138,7 +138,9 @@ def test_canonical_packet_is_stable_and_binds_each_approval_field(tmp_path):
     body, digest = canonical_approval_packet(state, "profile-A")
     assert canonical_approval_packet(state, "profile-A") == (body, digest)
     assert digest == hashlib.sha256(body.encode()).hexdigest()
-    assert set(json.loads(body)) == PACKET_KEYS
+    packet = json.loads(body)
+    assert set(packet) == PACKET_KEYS
+    assert packet["task_id"] == state.task_id
     mutations = {
       "objective": lambda s: dataclasses.replace(s, task=dataclasses.replace(s.task, objective="Objective B")),
       "inspection evidence": lambda s: dataclasses.replace(s, inspection=InspectionEvidenceRef("inspect", "Evidence B")),

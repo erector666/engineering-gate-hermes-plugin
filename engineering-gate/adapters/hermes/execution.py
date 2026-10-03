@@ -109,13 +109,21 @@ class GateExecutionAdapter:
         store.record_mutation_proposal(task_id, proposal)
         authority = GateMutationAuthority(store, implementer_id="engineering-gate-hermes")
         try:
-            verdict = provider(task_id, proposal)
-            authority.record_signed_verdict(task_id, verdict)
+            packet_body, packet_digest = canonical_approval_packet(state, self.profile_id)
+            if getattr(provider, "_reviewer_service_v1", False):
+                verdict = provider(task_id, proposal, state=state, approval_packet=packet_body,
+                                   approval_packet_digest=packet_digest, content=content)
+            else:
+                verdict = provider(task_id, proposal)
+            authorization = authority.record_signed_verdict(task_id, verdict)
         except Exception:
             # No safe retry transition exists in the frozen core. Fail the task
             # terminally so a later dispatch cannot reuse an ambiguous proposal.
             store.transition(task_id, Event.FAIL)
             raise
+        if authorization is None:
+            store.transition(task_id, Event.REJECT)
+            raise PermissionError("reviewer signed rejection")
         root = Path(state.plan.workspace_identity.canonical_path)
         # Keep this per-store wrapper narrow: it guards the callback inside the
         # StateStore transaction used by GateWriteService for the actual write.

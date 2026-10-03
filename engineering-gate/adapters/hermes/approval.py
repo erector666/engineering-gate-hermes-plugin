@@ -23,7 +23,7 @@ _workflow = import_core("workflow")
 canonical_plan_digest = _workflow.canonical_plan_digest
 capture_workspace_identity = _workflow.capture_workspace_identity
 
-_APPROVAL_PACKET_KEYS = frozenset({"task_objective", "inspection_evidence", "analysis", "plan", "blast_radius", "plan_review", "plan_revision", "plan_digest", "workspace_identity", "approval_request_id", "profile_id"})
+_APPROVAL_PACKET_KEYS = frozenset({"task_id", "task_objective", "inspection_evidence", "analysis", "plan", "blast_radius", "plan_review", "plan_revision", "plan_digest", "workspace_identity", "approval_request_id", "profile_id"})
 
 
 def _valid_approval_packet(body, digest):
@@ -60,6 +60,7 @@ def canonical_approval_packet(state, profile_id=None):
     workspace = None if plan is None else plan.workspace_identity
     request = state.approval_request
     packet = {
+        "task_id": state.task_id,
         "task_objective": state.task.objective,
         "inspection_evidence": state.inspection,
         "analysis": state.analysis,

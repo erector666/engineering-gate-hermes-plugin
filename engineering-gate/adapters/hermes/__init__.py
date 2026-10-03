@@ -98,6 +98,22 @@ def register(ctx) -> None:
         from .approval_sidecar import ApprovalSidecar
         execution_adapter = GateExecutionAdapter(profile_home=profile_home, profile_id=profile_id,
             state_store_provider=store_for_active_profile, approval_sidecar=ApprovalSidecar(profile_home))
+        # The socket client is enabled only by an explicit nonsecret profile config.
+        try:
+            config_path = profile_home / "engineering-gate-reviewer-service.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if type(config) is dict and set(config) == {"socket_path", "key_id", "timeout_seconds"}:
+                from .reviewer_service import ReviewerServiceClient
+                client = ReviewerServiceClient(config["socket_path"], key_id=config["key_id"],
+                                               timeout=config["timeout_seconds"])
+                def review(task_id, proposal, **binding):
+                    return client.bind_store(store_for_active_profile(profile_id))(
+                        task_id, proposal, **binding)
+                review._reviewer_service_v1 = True
+                execution_adapter._reviewer_verdict_provider = review
+        except Exception:
+            # Invalid/missing config deliberately preserves the absent-provider block.
+            pass
 
         async def gate_approve_plan(args, **kwargs):
             if type(args) is not dict or set(args) != {"task_id"}:
