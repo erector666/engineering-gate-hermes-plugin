@@ -13,14 +13,37 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
 from adapters.hermes.approval import GateApprovalService  # noqa: E402
 from adapters.hermes.approval_sidecar import ApprovalSidecar  # noqa: E402
-from engineering_gate_core.models import Plan, NormalizedOperation, OperationKind, AcceptanceCriterion
+from engineering_gate_core.models import (Plan, NormalizedOperation, OperationKind, AcceptanceCriterion,
+    Task, TaskState, TaskStateRecord, PlanRevision, InspectionEvidenceRef, Evidence,
+    WorkspaceIdentity, PlanReview, ReviewVerdict, ApprovalRequest, RequesterIdentity)
 from engineering_gate_core.workflow import canonical_plan_digest
 
 PLAN = Plan("objective", (NormalizedOperation(OperationKind.READ, "src", "inspect"),),
-            (AcceptanceCriterion("c1", "checked", "run tests"),), ("pytest",))
+            (AcceptanceCriterion("c1", "checked", "run tests"),), ("pytest",),
+            workspace_root="/workspace", workspace_identity=WorkspaceIdentity("/workspace", 1, 2))
 
 def render_plan(plan):
     return json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"))
+
+def approval_state(analysis="exact evidence"):
+    from engineering_gate_core.models import PlanDigest
+    plan = PLAN
+    return TaskStateRecord(Task("task-1", "objective", RequesterIdentity("telegram:42")),
+        TaskState.AWAITING_APPROVAL, PlanRevision(2), (TaskState.AWAITING_APPROVAL,),
+        inspection=InspectionEvidenceRef("inspection", "inspected src"),
+        analysis=Evidence("analysis", analysis), plan=plan, plan_digest=PlanDigest(str(canonical_plan_digest(plan))),
+        blast_radius=Evidence("blast", "limited to src"), plan_review=PlanReview(ReviewVerdict.APPROVED),
+        approval_request=ApprovalRequest("task-1", PlanRevision(2), PlanDigest(str(canonical_plan_digest(plan))), "approval-1"))
+
+def packet_data(state):
+    from adapters.hermes.approval import canonical_approval_packet
+    body, digest = canonical_approval_packet(state, "main")
+    return body, digest
+
+
+def packet_text(body, digest):
+    return body + "\n\nApproval packet digest: " + digest
+
 
 def scope(**overrides):
     data = dict(profile_id="main", session_id="session-1", telegram_user_id=42,
@@ -40,14 +63,17 @@ class Bot:
 
 def test_create_pending_uses_exact_durable_binding_and_display_hash(tmp_path):
     service = GateApprovalService(tmp_path, bot=None, render_plan=render_plan, clock=lambda: 100)
-    text = render_plan(PLAN) + "\n\nCanonical plan digest: " + scope()["plan_digest"]
-    pending = service.create_pending(**scope(), plan_text=text, timeout_seconds=30)
+    state = approval_state()
+    body, digest = packet_data(state)
+    text = packet_text(body, digest)
+    pending = service.create_pending(**scope(), approval_state=state, approval_packet_body=body, approval_packet_digest=digest,
+        plan_text=text, timeout_seconds=30)
     assert pending is not None
     record = service.sidecar.get(pending.nonce, profile_id="main")
     assert record == dict(profile_id="main", session_id="session-1", telegram_user_id=42,
         telegram_chat_id=42, task_id="task-1", plan_revision=2, plan_digest=scope()["plan_digest"],
         workspace_identity=scope()["workspace_identity"], approval_request_id="approval-1",
-        plan_display_digest=hashlib.sha256(text.encode()).hexdigest(), created_at=100,
+        approval_packet_digest=digest, created_at=100,
         expires_at=130, nonce=pending.nonce, prompt_message_id=None, delivered=False, state="pending")
 
 def test_old_incomplete_api_returns_without_hanging(tmp_path):
@@ -65,8 +91,11 @@ def test_old_incomplete_api_returns_without_hanging(tmp_path):
 def test_stale_binding_fails_closed(tmp_path, bad):
     service = GateApprovalService(tmp_path, bot=None, render_plan=render_plan, clock=lambda: 100)
     data = scope()
-    text = render_plan(PLAN) + "\n\nCanonical plan digest: " + data["plan_digest"]
-    p = service.create_pending(**data, plan_text=text, timeout_seconds=30)
+    state = approval_state()
+    body, digest = packet_data(state)
+    text = packet_text(body, digest)
+    p = service.create_pending(**data, approval_state=state, approval_packet_body=body, approval_packet_digest=digest,
+        plan_text=text, timeout_seconds=30)
     assert p is not None
     assert service.consume_callback(p.nonce, actor_id=42, chat_id=42, chat_type="private",
         choice="approve_once", expected_context={**{k:v for k,v in data.items() if k != "plan_payload"}, **bad}) is False
@@ -85,7 +114,10 @@ def test_request_persists_prompt_only_after_plan_and_controls_confirmed(tmp_path
     async def scenario():
         bot = ConfirmingBot()
         service = GateApprovalService(tmp_path, bot=bot, render_plan=render_plan)
-        task = asyncio.create_task(service.request(**scope(), timeout_seconds=10))
+        state = approval_state()
+        packet_body, packet_digest = packet_data(state)
+        task = asyncio.create_task(service.request(**scope(), timeout_seconds=10,
+            approval_state=state, approval_packet_body=packet_body, approval_packet_digest=packet_digest))
         await asyncio.wait_for(bot.prompt_sent.wait(), timeout=2)
         nonce = next(iter(service.futures))
         record = service.sidecar.get(nonce, profile_id="main")
@@ -93,6 +125,10 @@ def test_request_persists_prompt_only_after_plan_and_controls_confirmed(tmp_path
         assert record["prompt_message_id"] == len(bot.calls)
         assert all(call["chat_id"] == 42 for call in bot.calls)
         assert "reply_markup" in bot.calls[-1]
+        assert bot.calls[-1]["text"] == "Approve this exact Engineering Gate approval packet?"
+        assert "".join(call["text"] for call in bot.calls[:-1]) == (
+            packet_body + "\n\nApproval packet digest: " + packet_digest)
+        assert record["approval_packet_digest"] == packet_digest
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -101,8 +137,11 @@ def test_request_persists_prompt_only_after_plan_and_controls_confirmed(tmp_path
 
 def test_delivery_failure_invalidates_without_controls(tmp_path):
     bot = Bot(fail_at=2)
-    service = GateApprovalService(tmp_path, bot=bot, render_plan=lambda p: "X"*8500)
-    result = asyncio.run(service.request(**scope(), timeout_seconds=0.2))
+    service = GateApprovalService(tmp_path, bot=bot, render_plan=render_plan)
+    state = approval_state("x" * 8500)
+    packet, packet_digest = packet_data(state)
+    result = asyncio.run(service.request(**scope(), timeout_seconds=0.2,
+        approval_state=state, approval_packet_body=packet, approval_packet_digest=packet_digest))
     assert result is False
     assert not any("reply_markup" in call for call in bot.calls)
     assert service.sidecar.get(next(iter(service.sidecar._db("main").execute("SELECT nonce FROM approvals")))[0], profile_id="main")["state"] == "cancelled"
@@ -121,9 +160,11 @@ def test_callback_requires_exact_delivered_prompt_id_and_chat(tmp_path):
     route_key = adapter._source_session_key(route_source)
     route_session_id = route_store.get_or_create_session(route_source).session_id
     data = scope(session_id=route_session_id)
+    state = approval_state()
+    packet_body, packet_digest = packet_data(state)
     service = GateApprovalService(tmp_path, bot=None, render_plan=render_plan)
-    text = render_plan(PLAN) + "\n\nCanonical plan digest: " + data["plan_digest"]
-    p = service.create_pending(**data, plan_text=text, timeout_seconds=30)
+    p = service.create_pending(**data, approval_state=state, approval_packet_body=packet_body, approval_packet_digest=packet_digest,
+        plan_text=packet_text(packet_body, packet_digest), timeout_seconds=30)
     service.sidecar.mark_prompt_delivered(p.nonce, profile_id="main", prompt_message_id=99,
         plan_chunks_confirmed=True, buttons_sent=True)
     loop = asyncio.get_event_loop_policy().new_event_loop()

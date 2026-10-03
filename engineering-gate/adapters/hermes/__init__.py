@@ -31,6 +31,11 @@ def _render_plan(plan):
     return json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"))
 
 
+def _approval_packet(state, profile_id):
+    from .approval import canonical_approval_packet
+    return canonical_approval_packet(state, profile_id)
+
+
 def register(ctx) -> None:
     """Register the approval tool and a per-context, fail-closed write readiness hook."""
     set_write_ready, make_readiness_binding = register_hooks(ctx)
@@ -118,6 +123,7 @@ def register(ctx) -> None:
                 workspace = plan.workspace_identity
                 if workspace is None:
                     return json.dumps({"approved": False, "error": "workspace identity missing"})
+                packet_body, packet_digest = _approval_packet(current, active_profile)
                 approved = await service.request(
                     profile_id=active_profile, session_id=trusted.session_id,
                     telegram_user_id=trusted.requester_id, telegram_chat_id=int(trusted.chat_id),
@@ -126,6 +132,8 @@ def register(ctx) -> None:
                     workspace_identity={"canonical_path": workspace.canonical_path,
                                         "device": workspace.device, "inode": workspace.inode},
                     approval_request_id=request.request_id, timeout_seconds=300,
+                    approval_state=current,
+                    approval_packet_body=packet_body, approval_packet_digest=packet_digest,
                 )
                 return json.dumps({"approved": bool(approved)})
             except Exception:

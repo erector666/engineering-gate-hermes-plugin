@@ -14,7 +14,7 @@ class ApprovalSidecar:
     _REQUIRED = (
         "profile_id", "session_id", "telegram_user_id", "telegram_chat_id",
         "task_id", "plan_revision", "plan_digest", "workspace_identity",
-        "approval_request_id", "plan_display_digest", "created_at", "expires_at",
+        "approval_request_id", "approval_packet_digest", "created_at", "expires_at",
     )
     _RECORD_FIELDS = frozenset(_REQUIRED) | {
         "nonce", "prompt_message_id", "delivered", "state",
@@ -59,7 +59,7 @@ class ApprovalSidecar:
         for key in ("telegram_user_id", "telegram_chat_id", "plan_revision"):
             if type(data[key]) is not int or data[key] < (0 if key == "plan_revision" else 1):
                 raise ValueError("invalid " + key)
-        for key in ("plan_digest", "plan_display_digest"):
+        for key in ("plan_digest", "approval_packet_digest"):
             if type(data[key]) is not str or not re.fullmatch(r"[0-9a-f]{64}", data[key]):
                 raise ValueError("invalid " + key)
         for key in ("created_at", "expires_at"):

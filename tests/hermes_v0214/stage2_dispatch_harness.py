@@ -46,7 +46,7 @@ class DispatchHarness:
     _native_handler: object
     _sidecar_db: object
     _record_id: str
-    _original_display_digest: str
+    _original_packet_digest: str
 
     @property
     def sidecar(self):
@@ -64,23 +64,23 @@ class DispatchHarness:
             + '.engineering_gate_core.' + module
         )
 
-    def tamper_display_digest(self):
+    def tamper_packet_digest(self):
         with self.sidecar._db('default') as db:
             row = db.execute('SELECT data FROM approvals WHERE nonce=?', (self._record_id,)).fetchone()
             record = json.loads(row[0])
-            record['plan_display_digest'] = '0' * 64 if self._original_display_digest != '0' * 64 else '1' * 64
+            record['approval_packet_digest'] = '0' * 64 if self._original_packet_digest != '0' * 64 else '1' * 64
             db.execute('UPDATE approvals SET data=? WHERE nonce=?',
                        (json.dumps(record, sort_keys=True, separators=(',', ':')), self._record_id))
 
-    def restore_display_digest(self):
+    def restore_packet_digest(self):
         with self.sidecar._db('default') as db:
             row = db.execute('SELECT data FROM approvals WHERE nonce=?', (self._record_id,)).fetchone()
             record = json.loads(row[0])
-            record['plan_display_digest'] = self._original_display_digest
+            record['approval_packet_digest'] = self._original_packet_digest
             db.execute('UPDATE approvals SET data=? WHERE nonce=?',
                        (json.dumps(record, sort_keys=True, separators=(',', ':')), self._record_id))
         restored = self.sidecar.find_unique_approved('default', 'task-stage2', self.fixture.request.request_id)
-        assert restored['plan_display_digest'] == self._original_display_digest
+        assert restored['approval_packet_digest'] == self._original_packet_digest
 
     def dispatch(self, args=None):
         return model_tools.handle_function_call(
@@ -170,4 +170,4 @@ def create_harness(*, final_path='B'):
     assert row is not None
     return DispatchHarness(home, workspace, routes, entry, fixture, manager, adapter, provider,
         request_seen, execution_seen, intercepted, native_calls, write_entry, native_handler,
-        None, row['nonce'], row['plan_display_digest'])
+        None, row['nonce'], row['approval_packet_digest'])

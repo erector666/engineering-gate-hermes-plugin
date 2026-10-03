@@ -77,13 +77,13 @@ def seed_approved_fixture(
     identity = current.plan.workspace_identity
     workspace_binding = {"canonical_path": identity.canonical_path, "device": identity.device, "inode": identity.inode}
     now = time.time()
-    rendered = json.dumps(asdict(current.plan), sort_keys=True, separators=(",", ":"))
-    displayed_plan = f"{rendered}\n\nCanonical plan digest: {current.plan_digest}"
+    from adapters.hermes.approval import canonical_approval_packet
+    _, packet_digest = canonical_approval_packet(current, profile_id)
     binding = dict(
         profile_id=profile_id, session_id=session_id, telegram_user_id=user_id, telegram_chat_id=chat_id,
         task_id=task_id, plan_revision=current.revision, plan_digest=str(current.plan_digest),
         workspace_identity=workspace_binding, approval_request_id=request.request_id,
-        plan_display_digest=hashlib.sha256(displayed_plan.encode("utf-8")).hexdigest(),
+        approval_packet_digest=packet_digest,
         created_at=now, expires_at=now + 3600,
     )
     sidecar = ApprovalSidecar(base)

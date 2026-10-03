@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "engineering-gate"))
-from adapters.hermes.approval import GateApprovalService
+from adapters.hermes.approval import GateApprovalService, canonical_approval_packet
 from engineering_gate_core.models import (
     AcceptanceCriterion, ApprovalRequest, Evidence, InspectionEvidenceRef, NormalizedOperation,
     OperationKind, Plan, PlanReview, RequesterIdentity, ReviewVerdict, TaskState,
@@ -68,12 +69,18 @@ def disposable_route(tmp_path, monkeypatch, *, user_id=42, chat_id=None):
 
 
 def make_scope(current, profile, root, session_id="s"):
+    packet_body, packet_digest = canonical_approval_packet(current, "main")
     return dict(profile_id="main", session_id=session_id, telegram_user_id=42, telegram_chat_id=42,
                 task_id="task-1", plan_revision=current.revision, plan_payload=current.plan,
                 plan_digest=str(canonical_plan_digest(current.plan)),
                 workspace_identity={"canonical_path": str(root.resolve()), "device": root.stat().st_dev,
                                     "inode": root.stat().st_ino},
-                approval_request_id="request-1")
+                approval_request_id="request-1", approval_packet_digest=packet_digest,
+                packet_body=packet_body, approval_state=current)
+
+
+def packet_text(scope):
+    return scope["packet_body"] + "\n\nApproval packet digest: " + scope["approval_packet_digest"]
 
 
 @pytest.mark.parametrize("choice, expected", [("approve_once", TaskState.APPROVED), ("deny", TaskState.REJECTED)])
@@ -87,8 +94,9 @@ def test_restart_callback_persists_exact_core_receipt(tmp_path, monkeypatch, cho
     adapter, routes, route = disposable_route(tmp_path, monkeypatch)
     scope = make_scope(current, profile, root, session_id=route.session_id)
     service = GateApprovalService(profile, bot=Bot(), render_plan=render)
-    text = f"{render(current.plan)}\n\nCanonical plan digest: {scope['plan_digest']}"
-    pending = service.create_pending(**scope, plan_text=text, timeout_seconds=30)
+    text = packet_text(scope)
+    pending = service.create_pending(**{k:v for k,v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"], plan_text=text, timeout_seconds=30)
     assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",
         prompt_message_id=9, plan_chunks_confirmed=True, buttons_sent=True)
     handler = []
@@ -133,30 +141,35 @@ def test_stale_sidecar_binding_cannot_write_approval_receipt(tmp_path, monkeypat
     profile.mkdir(mode=0o700)
     root = tmp_path / "workspace"
     root.mkdir()
-    store = StateStore(tmp_path / "state.sqlite3")
+    db = tmp_path / "state.sqlite3"
+    store = StateStore(db)
     current = awaiting(store, root)
-    adapter, routes, route = disposable_route(tmp_path, monkeypatch)
+    adapter, _, route = disposable_route(tmp_path, monkeypatch)
     scope = make_scope(current, profile, root, session_id=route.session_id)
-    scope[field] = {"plan_revision": current.revision - 1,
-                    "plan_digest": scope["plan_digest"],
-                    "approval_request_id": "stale-request"}[field]
-    if field == "plan_digest":
-        stale_plan = Plan("different inspect", current.plan.operations,
-            current.plan.acceptance_criteria, current.plan.verification_commands,
-            workspace_root=current.plan.workspace_root,
-            workspace_identity=current.plan.workspace_identity)
-        scope["plan_payload"] = stale_plan
-        scope["plan_digest"] = str(canonical_plan_digest(stale_plan))
     service = GateApprovalService(profile, bot=Bot(), render_plan=render)
-    pending = service.create_pending(**scope,
-        plan_text=f"{render(scope['plan_payload'])}\n\nCanonical plan digest: {scope['plan_digest']}",
-        timeout_seconds=30)
+    pending = service.create_pending(**{k:v for k,v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"],
+        plan_text=packet_text(scope), timeout_seconds=30)
     assert pending is not None
     assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",
         prompt_message_id=9, plan_chunks_confirmed=True, buttons_sent=True)
+
+    if field == "plan_revision":
+        changed = replace(current, revision=current.revision + 1)
+    elif field == "plan_digest":
+        changed_plan = Plan("different inspect", current.plan.operations,
+            current.plan.acceptance_criteria, current.plan.verification_commands,
+            workspace_root=current.plan.workspace_root,
+            workspace_identity=current.plan.workspace_identity)
+        changed = replace(current, plan=changed_plan,
+                          plan_digest=str(canonical_plan_digest(changed_plan)))
+    else:
+        changed_request = replace(current.approval_request, request_id="changed-request")
+        changed = replace(current, approval_request=changed_request)
     restarted = invoke_callback(tmp_path, profile,
-        lambda profile_id: StateStore(tmp_path / "state.sqlite3"), pending, adapter)
-    updated = StateStore(tmp_path / "state.sqlite3").load("task-1")
+        lambda profile_id: SimpleNamespace(load=lambda task_id: changed), pending, adapter)
+
+    updated = StateStore(db).load("task-1")
     assert updated.state is TaskState.AWAITING_APPROVAL
     assert updated.approval is None
     assert restarted.sidecar.get(pending.nonce, profile_id="main")["state"] == "pending"
@@ -191,8 +204,9 @@ def test_callback_rejects_cross_profile_even_when_session_id_matches(tmp_path, m
 
     scope = make_scope(current, profile, root, session_id="same-session")
     service = GateApprovalService(profile, bot=Bot(), render_plan=render)
-    pending = service.create_pending(**scope,
-        plan_text=f"{render(current.plan)}\n\nCanonical plan digest: {scope['plan_digest']}",
+    pending = service.create_pending(**{k:v for k,v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"],
+        plan_text=packet_text(scope),
         timeout_seconds=30)
     assert pending is not None
     assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",
@@ -236,8 +250,9 @@ def test_callback_rejects_when_current_telegram_route_session_changed(tmp_path, 
     bound_session_id = route_entry.session_id
     scope = make_scope(current, profile, root, session_id=bound_session_id)
     service = GateApprovalService(profile, bot=Bot(), render_plan=render)
-    text = f"{render(current.plan)}\n\nCanonical plan digest: {scope['plan_digest']}"
-    pending = service.create_pending(**scope,
+    text = packet_text(scope)
+    pending = service.create_pending(**{k:v for k,v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"],
         plan_text=text,
         timeout_seconds=30)
     assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",
@@ -271,12 +286,12 @@ def test_callback_requester_must_match_persisted_task_requester(tmp_path, monkey
     root.mkdir()
     store = StateStore(tmp_path / "state.sqlite3")
     current = awaiting(store, root)
-    adapter, routes, route = disposable_route(tmp_path, monkeypatch, user_id=43, chat_id=43)
+    adapter, routes, route = disposable_route(tmp_path, monkeypatch, user_id=42, chat_id=42)
     scope = make_scope(current, profile, root, session_id=route.session_id)
-    scope.update(telegram_user_id=43, telegram_chat_id=43)
     service = GateApprovalService(profile, bot=Bot(), render_plan=render)
-    pending = service.create_pending(**scope,
-        plan_text=f"{render(current.plan)}\n\nCanonical plan digest: {scope['plan_digest']}",
+    pending = service.create_pending(**{k:v for k,v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"],
+        plan_text=packet_text(scope),
         timeout_seconds=30)
     assert pending is not None
     assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",
@@ -284,6 +299,34 @@ def test_callback_requester_must_match_persisted_task_requester(tmp_path, monkey
     restarted = invoke_callback(tmp_path, profile,
         lambda profile_id: StateStore(tmp_path / "state.sqlite3"), pending, adapter, actor_id=43, chat_id=43)
     updated = StateStore(tmp_path / "state.sqlite3").load("task-1")
+    assert updated.state is TaskState.AWAITING_APPROVAL
+    assert updated.approval is None
+    assert restarted.sidecar.get(pending.nonce, profile_id="main")["state"] == "pending"
+
+
+def test_callback_denies_when_approval_evidence_changes_after_delivery(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o700)
+    root = tmp_path / "workspace"
+    root.mkdir()
+    db = tmp_path / "state.sqlite3"
+    store = StateStore(db)
+    current = awaiting(store, root)
+    adapter, _, route = disposable_route(tmp_path, monkeypatch)
+    scope = make_scope(current, profile, root, session_id=route.session_id)
+    service = GateApprovalService(profile, bot=Bot(), render_plan=render)
+    pending = service.create_pending(**{k: v for k, v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"],
+        plan_text=packet_text(scope), timeout_seconds=30)
+    assert pending is not None
+    assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",
+        prompt_message_id=9, plan_chunks_confirmed=True, buttons_sent=True)
+
+    changed = replace(current, analysis=Evidence("analysis", "changed after delivery"))
+    restarted = invoke_callback(tmp_path, profile,
+        lambda profile_id: SimpleNamespace(load=lambda task_id: changed), pending, adapter)
+
+    updated = StateStore(db).load("task-1")
     assert updated.state is TaskState.AWAITING_APPROVAL
     assert updated.approval is None
     assert restarted.sidecar.get(pending.nonce, profile_id="main")["state"] == "pending"
@@ -300,8 +343,9 @@ def test_record_approval_failure_leaves_no_receipt_and_consumes_sidecar(tmp_path
     adapter, routes, route = disposable_route(tmp_path, monkeypatch)
     scope = make_scope(current, profile, root, session_id=route.session_id)
     service = GateApprovalService(profile, bot=Bot(), render_plan=render)
-    pending = service.create_pending(**scope,
-        plan_text=f"{render(current.plan)}\n\nCanonical plan digest: {scope['plan_digest']}",
+    pending = service.create_pending(**{k:v for k,v in scope.items() if k not in ("packet_body", "approval_state")},
+        approval_state=current, approval_packet_body=scope["packet_body"],
+        plan_text=packet_text(scope),
         timeout_seconds=30)
     assert pending is not None
     assert service.sidecar.mark_prompt_delivered(pending.nonce, profile_id="main",

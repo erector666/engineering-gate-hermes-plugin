@@ -20,7 +20,7 @@ def binding(**overrides):
         telegram_chat_id=42, task_id="task-1", plan_revision=3,
         plan_digest="a" * 64,
         workspace_identity={"canonical_path": "/work", "device": 1, "inode": 2},
-        approval_request_id="request-1", plan_display_digest="b" * 64,
+        approval_request_id="request-1", approval_packet_digest="b" * 64,
         created_at=now, expires_at=now + 3600,
     )
     value.update(overrides)
@@ -50,6 +50,8 @@ def test_create_persists_fully_bound_pending_record_and_nonce_is_32_random_bytes
     reopened = ApprovalSidecar(tmp_path / "profile-main")
     record = reopened.get(nonce, profile_id="main")
     assert record["state"] == "pending"
+    assert record["approval_packet_digest"] == binding()["approval_packet_digest"]
+    assert "plan_display_digest" not in record
     assert record["workspace_identity"] == binding()["workspace_identity"]
     assert (tmp_path / "profile-main" / "engineering-gate-approvals.sqlite3").stat().st_mode & 0o777 == 0o600
 

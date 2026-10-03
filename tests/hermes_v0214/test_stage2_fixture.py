@@ -1,6 +1,3 @@
-from dataclasses import asdict
-import hashlib
-import json
 from pathlib import Path
 
 from stage2_fixture import seed_approved_fixture
@@ -13,6 +10,7 @@ def test_seed_approved_fixture_persists_exact_receipt_and_delivered_sidecar(tmp_
 
     current = fixture.store.load(fixture.task_id)
     assert current.state.value == "approved"
+    from adapters.hermes.approval import canonical_approval_packet
     assert current.approval is not None and current.approval.approved is True
     assert current.approval.request_id == fixture.request.request_id
     assert current.approval.task_id == current.task_id
@@ -46,9 +44,8 @@ def test_seed_approved_fixture_persists_exact_receipt_and_delivered_sidecar(tmp_
     }
     assert {key: record.get(key) for key in expected} == expected
     assert record["state"] == "approved"
-    rendered = json.dumps(asdict(current.plan), sort_keys=True, separators=(",", ":"))
-    display = f"{rendered}\n\nCanonical plan digest: {current.plan_digest}"
-    assert record["plan_display_digest"] == hashlib.sha256(display.encode("utf-8")).hexdigest()
+    assert record["approval_packet_digest"] == canonical_approval_packet(current, fixture.profile_id)[1]
+
     assert fixture.workspace == workspace.resolve()
     assert fixture.store.path == tmp_path.resolve() / "engineering-gate-state.sqlite3"
     assert fixture.sidecar.profile_home == tmp_path.resolve()

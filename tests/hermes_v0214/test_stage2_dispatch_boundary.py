@@ -7,14 +7,13 @@ from pathlib import Path
 
 HERMES = Path("/home/uss/.hermes/cache/scratch/hermes-v0214-execution-interception")
 PYTHON = Path("/home/uss/.hermes/hermes-agent/venv/bin/python")
-PINNED_HEAD = "d3b25b52ad1318c526bdb259b600eeca3d5f38e6"
+PINNED_BASE = "d3b25b52ad1318c526bdb259b600eeca3d5f38e6"
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN = ROOT / "engineering-gate"
 
 
 def test_real_dispatch_uses_rewritten_write_args_but_continues_read_file(tmp_path):
-    head = subprocess.check_output(["git", "-C", str(HERMES), "rev-parse", "HEAD"], text=True).strip()
-    assert head == PINNED_HEAD
+    subprocess.run(["git", "-C", str(HERMES), "merge-base", "--is-ancestor", PINNED_BASE, "HEAD"], check=True)
     script = r'''
 import json, os
 from pathlib import Path

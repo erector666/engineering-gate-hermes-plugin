@@ -1,7 +1,6 @@
 """Fail-closed final write interception with an instance-local Gate tracer."""
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 import uuid
@@ -69,12 +68,13 @@ class GateExecutionAdapter:
             raise PermissionError("no current approved task")
         if record["approval_request_id"] != request.request_id:
             raise PermissionError("sidecar request does not match current Gate request")
-        from dataclasses import asdict
-        canonical_plan_digest = import_core("workflow").canonical_plan_digest
-        displayed_plan = json.dumps(asdict(state.plan), sort_keys=True, separators=(",", ":")) + "\n\nCanonical plan digest: " + canonical_plan_digest(state.plan)
-        expected_display_digest = hashlib.sha256(displayed_plan.encode("utf-8")).hexdigest()
-        if record is None or record.get("plan_display_digest") != expected_display_digest:
-            raise PermissionError("Stage-1 displayed plan digest does not match current approved plan")
+        from .approval import canonical_approval_packet
+        expected_packet_digest = record.get("approval_packet_digest")
+        if not isinstance(expected_packet_digest, str):
+            raise PermissionError("Stage-1 approval packet digest is missing")
+        _, current_packet_digest = canonical_approval_packet(state, self.profile_id)
+        if current_packet_digest != expected_packet_digest:
+            raise PermissionError("Stage-1 approval packet digest does not match current approved task")
         if record.get("expires_at", 0) <= time.time():
             raise PermissionError("Stage-1 approval has expired")
         if not record["delivered"] or any(record.get(k) != v for k,v in {
@@ -117,8 +117,35 @@ class GateExecutionAdapter:
             store.transition(task_id, Event.FAIL)
             raise
         root = Path(state.plan.workspace_identity.canonical_path)
+        # Keep this per-store wrapper narrow: it guards the callback inside the
+        # StateStore transaction used by GateWriteService for the actual write.
+        original_state_transaction = store.with_current_state_transaction
+
+        def with_packet_guard(task_id_arg, callback):
+            def guarded_callback(current):
+                if (current.task_id != task_id
+                        or current.state is not TaskState.IMPLEMENTING
+                        or current.plan is None
+                        or int(current.revision) != int(record["plan_revision"])):
+                    raise PermissionError("task revision or state changed before Gate write")
+                _, transaction_packet_digest = canonical_approval_packet(current, self.profile_id)
+                if transaction_packet_digest != expected_packet_digest:
+                    raise PermissionError("approval packet changed before Gate write")
+                return callback(current)
+            return original_state_transaction(task_id_arg, guarded_callback)
+
+        store.with_current_state_transaction = with_packet_guard
         with GateWriteService(root, state_store=store, mutation_authority=authority) as writer:
             permit = writer.issue_permit(task_id=task_id, operation=operation, arguments={"content":content})
+            # Retain the outer recheck; the instance wrapper closes the race after it.
+            state = store.load(task_id)
+            if (state.state is not TaskState.IMPLEMENTING
+                    or state.plan is None
+                    or int(state.revision) != int(record["plan_revision"])):
+                raise PermissionError("task revision or state changed before Gate write")
+            _, current_packet_digest = canonical_approval_packet(state, self.profile_id)
+            if current_packet_digest != expected_packet_digest:
+                raise PermissionError("approval packet changed before Gate write")
             written = writer.execute(permit, task_id=task_id, operation=operation, arguments={"content":content})
         if written.read_bytes() != content.encode("utf-8"):
             raise PermissionError("Gate readback mismatch")

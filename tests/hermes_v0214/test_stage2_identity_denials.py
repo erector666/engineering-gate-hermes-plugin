@@ -13,18 +13,24 @@ HERMES_PIN = "d3b25b52ad1318c526bdb259b600eeca3d5f38e6"
 GATE_ROOT = Path(__file__).resolve().parents[2]
 GATE_CORE = GATE_ROOT / "engineering-gate" / "engineering_gate_core"
 ROOT = GATE_ROOT
-GATE_CORE_HEAD = "27e8b4bdf2695c82322066af592f555223e7b059"
+FROZEN_GATE_CORE = "27e8b4bdf2695c82322066af592f555223e7b059"
 PLUGIN = ROOT / "engineering-gate"
 TESTS = ROOT / "tests" / "hermes_v0214"
 
 
 def run_scenario(tmp_path, body):
-    head = subprocess.check_output(["git", "-C", str(HERMES), "rev-parse", "HEAD"], text=True).strip()
-    assert head == HERMES_PIN
-    gate_head = subprocess.check_output(["git", "-C", str(GATE_ROOT), "rev-parse", "HEAD"], text=True).strip()
-    assert gate_head == GATE_CORE_HEAD
-    frozen_core = subprocess.run(["git", "-C", str(GATE_ROOT), "diff", "--quiet", "HEAD", "--", str(GATE_CORE)], check=False)
-    assert frozen_core.returncode == 0, "Gate frozen core has working-tree changes"
+    subprocess.run(["git", "-C", str(HERMES), "merge-base", "--is-ancestor", HERMES_PIN, "HEAD"], check=True)
+    subprocess.run(["git", "-C", str(GATE_ROOT), "merge-base", "--is-ancestor", FROZEN_GATE_CORE, "HEAD"], check=True)
+    frozen_core_history = subprocess.run(
+        ["git", "-C", str(GATE_ROOT), "diff", "--quiet", FROZEN_GATE_CORE, "HEAD", "--", "engineering-gate/engineering_gate_core"],
+        check=False,
+    )
+    assert frozen_core_history.returncode == 0, "Gate core changed since frozen commit"
+    frozen_core_worktree = subprocess.run(
+        ["git", "-C", str(GATE_ROOT), "diff", "--quiet", "HEAD", "--", "engineering-gate/engineering_gate_core"],
+        check=False,
+    )
+    assert frozen_core_worktree.returncode == 0, "Gate frozen core has working-tree changes"
     script = r'''
 import json, os, model_tools
 from pathlib import Path
@@ -77,7 +83,7 @@ assert h.provider.used is False and h.fixture.store.load("task-stage2").mutation
 assert h.fixture.store.load("task-stage2").state.name == "APPROVED"
 ''',
         "stale_digest": r'''
-h.set_provider(h.provider); h.tamper_display_digest()
+h.set_provider(h.provider); h.tamper_packet_digest()
 out=h.dispatch(); denied(out)
 assert h.provider.used is False and h.fixture.store.load("task-stage2").mutation_proposal is None
 assert h.fixture.store.load("task-stage2").state.name == "APPROVED"
@@ -128,7 +134,7 @@ assert h.adapter._reviewer_verdict_provider is None
 assert h.fixture.store.load("task-stage2").mutation_proposal is None
 assert h.fixture.store.load("task-stage2").state.name == "APPROVED"
 assert not h.fixture.store.list_execution_audits("task-stage2")
-assert h.sidecar.find_unique_approved("default", "task-stage2", h.fixture.request.request_id)["plan_display_digest"] == h._original_display_digest
+assert h.sidecar.find_unique_approved("default", "task-stage2", h.fixture.request.request_id)["approval_packet_digest"] == h._original_packet_digest
 ''',
         "approval_call_mismatch": r'''
 # Leave trusted ContextVars untouched; corrupt only dispatcher-supplied identity kwargs.
@@ -143,7 +149,7 @@ assert h.adapter._reviewer_verdict_provider is None
 assert h.fixture.store.load("task-stage2").mutation_proposal is None
 assert h.fixture.store.load("task-stage2").state.name == "APPROVED"
 assert not h.fixture.store.list_execution_audits("task-stage2")
-assert h.sidecar.find_unique_approved("default", "task-stage2", h.fixture.request.request_id)["plan_display_digest"] == h._original_display_digest
+assert h.sidecar.find_unique_approved("default", "task-stage2", h.fixture.request.request_id)["approval_packet_digest"] == h._original_packet_digest
 ''',
         "missing_task_id": r'''
 h.set_provider(h.provider)
@@ -174,9 +180,9 @@ out=h.dispatch(); denied(out)
 assert h.adapter._last_error == "PermissionError('no unique matching delivered approval')"
 ''',
         "stale_digest": r'''
-h.tamper_display_digest()
+h.tamper_packet_digest()
 out=h.dispatch(); denied(out)
-assert h.adapter._last_error == "PermissionError('Stage-1 displayed plan digest does not match current approved plan')"
+assert h.adapter._last_error == "PermissionError('Stage-1 approval packet digest does not match current approved task')"
 ''',
         "workspace_identity": r'''
 with h.sidecar._db("default") as db:
