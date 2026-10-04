@@ -11,6 +11,12 @@ from engineering_gate_core.workflow import canonical_plan_digest, canonical_muta
 from engineering_gate_core.signed_authorization import verify_signed_verdict, ReviewerPublicKey, SignedMutationVerdict
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from types import SimpleNamespace
+
+def profile_fixture(**overrides):
+    values=dict(model="acme-review-v3",provider="acme",adapter="fake",endpoint="http://127.0.0.1:8123/review",api_key_file="",timeout_seconds=5,max_output_tokens=64,input_price_per_million_usd=7,output_price_per_million_usd=11,daily_budget_usd=1,max_calls_per_day=3,privacy={"store":False,"tools":False},provider_identity="acme:acme-review-v3")
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def fixture_request():
@@ -27,7 +33,7 @@ def test_task_objective_can_be_refined_but_both_objectives_are_reviewed():
     request["approval_packet"]["task_objective"]="Original task: create and verify a safe artifact"
     request["approval_packet_digest"]=hashlib.sha256(json.dumps(request["approval_packet"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     assert validate_request(request) is request
-    body=responses_body(request)
+    body=responses_body(request,profile_fixture())
     instructions=body["input"][0]["content"][0]["text"]
     context=json.loads(body["input"][1]["content"][0]["text"])
     assert context["approval_packet"]["task_objective"]=="Original task: create and verify a safe artifact"
@@ -93,24 +99,24 @@ def test_rejects_extra_caller_verdict():
 
 def test_signs_service_owned_positive_verdict_and_binds_exact_model_request(tmp_path):
     req=fixture_request(); key=Ed25519PrivateKey.generate(); raw=key.private_bytes_raw(); pub=key.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)
-    ledger=Ledger(tmp_path/"ledger.sqlite")
+    ledger=Ledger(tmp_path/"ledger.sqlite",max_reviews_per_day=3,daily_budget_usd=1,input_price_per_million_usd=7,output_price_per_million_usd=11,max_output_tokens=64)
     bodies=[]
     def transport(body):
-        bodies.append(body); return {"status":"completed","model":"gpt-6.1-sol","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}],"usage":{"input_tokens":10,"output_tokens":2}}
-    result=decide_and_sign(req,transport=transport,private_key=raw,key_id="key-1",ledger=ledger)
+        bodies.append(body); return {"status":"completed","model":"acme-review-v3","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}],"usage":{"input_tokens":10,"output_tokens":2}}
+    result=decide_and_sign(req,transport=transport,private_key=raw,key_id="key-1",ledger=ledger,profile=profile_fixture())
     assert set(result)=={"canonical_payload_b64","signature_b64"}
     body=bodies[0]
-    assert body["model"]=="gpt-6.1-sol" and body["store"] is False and body["tools"]==[] and body["tool_choice"]=="none" and body["reasoning"]=={"effort":"high"}
-    assert body["max_output_tokens"]==2048 and body["text"]["format"]["strict"] is True
+    assert body["model"]=="acme-review-v3" and body["store"] is False and body["tools"]==[] and body["tool_choice"]=="none" and body["reasoning"]=={"effort":"high"}
+    assert body["max_output_tokens"]==64 and body["text"]["format"]["strict"] is True
     payload=base64.b64decode(result["canonical_payload_b64"]); signature=base64.b64decode(result["signature_b64"])
-    verified=verify_signed_verdict(SignedMutationVerdict(payload,signature),ReviewerPublicKey("key-1","engineering-gate-reviewer-v1","openai:gpt-6.1-sol",pub),now=__import__('datetime').datetime.now(__import__('datetime').timezone.utc),implementer_id="engineering-gate-hermes")
+    verified=verify_signed_verdict(SignedMutationVerdict(payload,signature),ReviewerPublicKey("key-1","engineering-gate-reviewer-v1",profile_fixture().provider_identity,pub),now=__import__('datetime').datetime.now(__import__('datetime').timezone.utc),implementer_id="engineering-gate-hermes")
     assert verified.verdict=="approve"
     with pytest.raises(Exception): ledger.reserve(req["review_request_id"],"x","x","x")
 
 def test_malformed_and_major_findings_fail_closed():
-    from reviewer_service.service import MODEL
-    with pytest.raises(Exception): parse_model_output({"status":"completed","model":MODEL,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"not json"}]}]})
-    assert parse_model_output({"status":"completed","model":MODEL,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[{"severity":"major","finding":"unsafe"}]})}]}]})=="reject"
+    profile=profile_fixture()
+    with pytest.raises(Exception): parse_model_output({"status":"completed","model":profile.model,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"not json"}]}]},profile.model)
+    assert parse_model_output({"status":"completed","model":profile.model,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[{"severity":"major","finding":"unsafe"}]})}]}]},profile.model)=="reject"
 
 def test_rejects_bad_binding_and_implementer():
     r=fixture_request(); r["proposal_digest"]="0"*64
@@ -125,17 +131,17 @@ def test_key_permissions_and_symlink_are_rejected(tmp_path):
     with pytest.raises(ValueError): load_private_key(link)
 
 def test_refusal_is_not_a_verdict():
-    from reviewer_service.service import MODEL
-    with pytest.raises(ValueError): parse_model_output({"status":"completed","model":MODEL,"output":[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"no"}]}]})
+    profile=profile_fixture()
+    with pytest.raises(ValueError): parse_model_output({"status":"completed","model":profile.model,"output":[{"type":"message","status":"completed","content":[{"type":"refusal","refusal":"no"}]}]},profile.model)
 
 def test_error_timeout_fail_closed_and_keeps_reservation(tmp_path):
-    req=fixture_request(); ledger=Ledger(tmp_path/"timeout.sqlite"); key=Ed25519PrivateKey.generate().private_bytes_raw()
+    req=fixture_request(); ledger=Ledger(tmp_path/"timeout.sqlite",max_reviews_per_day=3,daily_budget_usd=1,input_price_per_million_usd=7,output_price_per_million_usd=11,max_output_tokens=64); key=Ed25519PrivateKey.generate().private_bytes_raw()
     def timeout(_body): raise TimeoutError("sensitive transport detail")
     with pytest.raises(ValueError,match="review unavailable"):
-        decide_and_sign(req,transport=timeout,private_key=key,key_id="k",ledger=ledger)
+        decide_and_sign(req,transport=timeout,private_key=key,key_id="k",ledger=ledger,profile=profile_fixture())
     row=ledger.db.execute("SELECT outcome,reserved FROM reviews WHERE request_id=?",(req["review_request_id"],)).fetchone()
     assert row[0]=="error" and row[1]>0
-    with pytest.raises(Exception): decide_and_sign(req,transport=timeout,private_key=key,key_id="k",ledger=ledger)
+    with pytest.raises(Exception): decide_and_sign(req,transport=timeout,private_key=key,key_id="k",ledger=ledger,profile=profile_fixture())
 
 def test_tampered_content_packet_types_and_task_bindings_are_rejected():
     for change in (lambda r:r["mutation_arguments"].update(content="tampered"),
@@ -149,9 +155,9 @@ def test_tampered_content_packet_types_and_task_bindings_are_rejected():
         with pytest.raises(ValueError): validate_request(request)
 
 def test_reject_decision_remains_reject_and_response_has_no_signer_fields(tmp_path):
-    req=fixture_request(); key=Ed25519PrivateKey.generate().private_bytes_raw(); ledger=Ledger(tmp_path/"reject.sqlite")
-    output={"status":"completed","model":"gpt-6.1-sol","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"reject","findings":[]})}]}],"usage":{"input_tokens":1,"output_tokens":1}}
-    result=decide_and_sign(req,transport=lambda _:output,private_key=key,key_id="k",ledger=ledger)
+    req=fixture_request(); key=Ed25519PrivateKey.generate().private_bytes_raw(); ledger=Ledger(tmp_path/"reject.sqlite",max_reviews_per_day=3,daily_budget_usd=1,input_price_per_million_usd=7,output_price_per_million_usd=11,max_output_tokens=64)
+    output={"status":"completed","model":"acme-review-v3","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"reject","findings":[]})}]}],"usage":{"input_tokens":1,"output_tokens":1}}
+    result=decide_and_sign(req,transport=lambda _:output,private_key=key,key_id="k",ledger=ledger,profile=profile_fixture())
     from engineering_gate_core.signed_authorization import _pairs_no_duplicates
     payload=json.loads(base64.b64decode(result["canonical_payload_b64"]),object_pairs_hook=_pairs_no_duplicates)
     assert payload["verdict"]=="reject"
@@ -159,35 +165,36 @@ def test_reject_decision_remains_reject_and_response_has_no_signer_fields(tmp_pa
     assert base64.b64encode(key).decode() not in json.dumps(result)
 
 def test_responses_contract_forbids_tools_and_pins_structured_output():
-    body=responses_body(fixture_request())
+    body=responses_body(fixture_request(),profile_fixture())
     assert body["tools"]==[] and body["tool_choice"]=="none" and body["store"] is False
     assert body["text"]["format"]["type"]=="json_schema" and body["text"]["format"]["strict"] is True
     assert body["text"]["format"]["schema"]["additionalProperties"] is False
 
 def test_response_binds_full_review_context_and_rejects_noncompleted_or_wrong_model():
-    from reviewer_service.service import parse_model_output, MODEL
+    from reviewer_service.service import parse_model_output
+    profile=profile_fixture()
     request=fixture_request()
-    body=responses_body(request)
+    body=responses_body(request,profile_fixture())
     context=json.loads(body["input"][1]["content"][0]["text"])
     assert context["task_id"]==request["task_id"]
     assert context["plan_revision"]==request["plan_revision"]
     assert context["plan_digest"]==request["plan_digest"]
     assert context["implementer_id"]==request["implementer_id"]
     assert context["mutation_arguments"]==request["mutation_arguments"]
-    valid={"status":"completed","model":MODEL,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}]}
-    assert parse_model_output(valid)=="approve"
+    valid={"status":"completed","model":profile.model,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}]}
+    assert parse_model_output(valid,profile.model)=="approve"
     for bad in ({**valid,"status":"incomplete"},{**valid,"status":"failed"},{**valid,"model":"other-model"},{**valid,"output":[{"type":"message","status":"incomplete","content":[{"type":"output_text","text":"{}"}]}]}):
-        with pytest.raises(ValueError): parse_model_output(bad)
+        with pytest.raises(ValueError): parse_model_output(bad,profile.model)
 
 def test_audit_log_is_structured_and_redacted(tmp_path,caplog):
     import logging
     from reviewer_service.service import decide_and_sign, Ledger
     request=fixture_request()
     key=Ed25519PrivateKey.generate().private_bytes_raw()
-    response={"status":"completed","model":"gpt-6.1-sol","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}],"usage":{"input_tokens":9,"output_tokens":2}}
-    ledger=Ledger(tmp_path/"audit.sqlite")
+    response={"status":"completed","model":"acme-review-v3","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}],"usage":{"input_tokens":9,"output_tokens":2}}
+    ledger=Ledger(tmp_path/"audit.sqlite",max_reviews_per_day=3,daily_budget_usd=1,input_price_per_million_usd=7,output_price_per_million_usd=11,max_output_tokens=64)
     with caplog.at_level(logging.INFO,logger="engineering_gate.reviewer_service"):
-        decide_and_sign(request,transport=lambda _:response,private_key=key,key_id="k",ledger=ledger)
+        decide_and_sign(request,transport=lambda _:response,private_key=key,key_id="k",ledger=ledger,profile=profile_fixture())
     assert caplog.records
     record=json.loads(caplog.records[-1].getMessage())
     assert set(record)=={"request_id","model","decision","outcome","request_digest","proposal_digest","packet_digest","input_tokens","output_tokens","cost_usd"}
@@ -197,24 +204,72 @@ def test_audit_log_is_structured_and_redacted(tmp_path,caplog):
     assert row is not None and "actual contents" not in repr(row)
     assert ledger.db.execute("PRAGMA table_info(reviews)").fetchall()
 
-def test_http_transport_rejects_noncanonical_endpoint():
-    from reviewer_service.service import http_transport
+def test_http_transport_helper_is_removed_so_no_provider_endpoint_is_implicit():
     import reviewer_service.service as service
-    called=[]
-    class Response:
-        def __enter__(self): return self
-        def __exit__(self,*_): pass
-        def read(self,_): return b"{}"
-    def fake_urlopen(req,**kwargs): called.append((req.full_url,req.get_header("Authorization"))); return Response()
-    service.urlopen=fake_urlopen
-    assert http_transport("synthetic",{})=={}
-    assert called==[("https://api.openai.com/v1/responses","Bearer synthetic")]
+    assert not hasattr(service,"http_transport")
+
+def test_run_service_uses_registered_adapter_and_accepts_loader_approved_no_key_profile(tmp_path,monkeypatch):
+    import reviewer_service.service as service
+    profile=profile_fixture()
+    captured={}
+    class FakeAdapter:
+        def send(self,key,body):
+            captured["key"]=key
+            return {"status":"completed","model":profile.model,"output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"reject","findings":[]})}]}],"usage":{"input_tokens":1,"output_tokens":1}}
+    monkeypatch.setattr(service,"load_profile",lambda _path:profile)
+    monkeypatch.setattr(service,"load_private_key",lambda _path:b"k"*32)
+    monkeypatch.setattr(service,"adapter_for",lambda name,loaded:(captured.update(adapter=name) or FakeAdapter()))
+    monkeypatch.setattr(service,"_api_key",lambda _path:pytest.fail("no-key loopback profile must not load a key"))
+    monkeypatch.setattr(service,"serve",lambda _path,handler,**kwargs:captured.update(handler=handler))
+    service.run_service(socket_path="unused",ledger_path=tmp_path/"ledger",private_key_path="unused",profile_path="trusted",key_id="k",client_uid=1,socket_gid=1)
+    result=captured["handler"](fixture_request())
+    assert captured["adapter"]=="fake" and captured["key"]==""
+    assert "signature_b64" in result
+
+def test_run_service_unknown_adapter_blocks_startup(tmp_path,monkeypatch):
+    import reviewer_service.service as service
+    monkeypatch.setattr(service,"load_profile",lambda _path:profile_fixture(adapter="not-registered"))
+    monkeypatch.setattr(service,"load_private_key",lambda _path:b"k"*32)
+    monkeypatch.setattr(service,"serve",lambda *_args,**_kwargs:pytest.fail("must not serve with unknown adapter"))
+    with pytest.raises(ValueError,match="unknown provider adapter"):
+        service.run_service(socket_path="unused",ledger_path=tmp_path/"ledger",private_key_path="unused",profile_path="trusted",key_id="k",client_uid=1,socket_gid=1)
+
+def test_profile_entry_points_have_no_model_or_endpoint_defaults():
+    import inspect
+    import reviewer_service.service as service
+    assert inspect.signature(service.responses_body).parameters["profile"].default is inspect.Parameter.empty
+    assert inspect.signature(service.parse_model_output).parameters["expected_model"].default is inspect.Parameter.empty
+    assert inspect.signature(service.decide_and_sign).parameters["profile"].default is inspect.Parameter.empty
+    assert not hasattr(service,"MODEL") and not hasattr(service,"REVIEWER_PROVIDER")
+
 
 def test_service_cli_requires_explicit_socket_identity_and_has_no_endpoint_override():
     import os, subprocess
     env=os.environ.copy(); env["PYTHONPATH"]=str(ROOT/"engineering-gate")
     help_run=subprocess.run([sys.executable,"-m","reviewer_service.service","--help"],env=env,text=True,capture_output=True,check=True)
     assert "--client-uid" in help_run.stdout and "--socket-gid" in help_run.stdout
-    assert "--endpoint" not in help_run.stdout
+    assert "--profile" in help_run.stdout and "--endpoint" not in help_run.stdout
     rejected=subprocess.run([sys.executable,"-m","reviewer_service.service","--socket","/tmp/x","--ledger","/tmp/y","--private-key","/tmp/z","--api-key-file","/tmp/k","--key-id","k","--client-uid","1","--socket-gid","1","--endpoint","http://127.0.0.1:9"],env=env,text=True,capture_output=True)
-    assert rejected.returncode==2 and "unrecognized arguments: --endpoint" in rejected.stderr
+    assert rejected.returncode==2 and "--profile" in rejected.stderr
+
+def test_configured_provider_model_identity_and_dynamic_prices(tmp_path):
+    from types import SimpleNamespace
+    req=fixture_request(); key=Ed25519PrivateKey.generate().private_bytes_raw()
+    profile=profile_fixture(model="Exact-X",provider_identity="Acme:Exact-X")
+    ledger=Ledger(tmp_path/"dynamic.sqlite",max_reviews_per_day=3,daily_budget_usd=1,
+                  input_price_per_million_usd=7,output_price_per_million_usd=11,max_output_tokens=64)
+    response={"status":"completed","model":"Exact-X","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":json.dumps({"decision":"approve","findings":[]})}]}],"usage":{"input_tokens":100,"output_tokens":10}}
+    body=[]
+    result=decide_and_sign(req,transport=lambda b:(body.append(b) or response),private_key=key,key_id="k",ledger=ledger,profile=profile)
+    assert body[0]["model"]=="Exact-X" and body[0]["max_output_tokens"]==64
+    payload=json.loads(base64.b64decode(result["canonical_payload_b64"]))
+    assert payload["reviewer_provider"]=="Acme:Exact-X"
+    row=ledger.db.execute("SELECT reserved,cost FROM reviews").fetchone()
+    assert row[0] > 0 and row[1] == pytest.approx((100*7+10*11)/1_000_000)
+
+def test_api_key_file_requires_restrictive_owned_regular_file(tmp_path):
+    from reviewer_service.service import _api_key
+    key=tmp_path/"key"; key.write_text("not-secret\n"); key.chmod(0o600)
+    with pytest.raises(ValueError): _api_key(key)
+    key.write_text("synthetic"); key.chmod(0o644)
+    with pytest.raises(ValueError): _api_key(key)

@@ -13,7 +13,6 @@ from pathlib import Path
 MAX_FRAME = 65_536
 IMPLEMENTER_ID = "engineering-gate-hermes"
 REVIEWER_ID = "engineering-gate-reviewer-v1"
-REVIEWER_PROVIDER = "openai:gpt-6.1-sol"
 
 
 def _json_value(value):
@@ -46,14 +45,14 @@ def _recv_exact(sock, size):
 
 class ReviewerServiceClient:
     """Fail-closed synchronous client; exactly one request and no retries."""
-    def __init__(self, socket_path, *, key_id, reviewer_id=REVIEWER_ID,
-                 reviewer_provider=REVIEWER_PROVIDER, timeout=75.0):
+    def __init__(self, socket_path, *, key_id, reviewer_provider, reviewer_id=REVIEWER_ID, timeout=75.0):
         if (type(socket_path) is not str or not socket_path or type(key_id) is not str or not key_id
-                or reviewer_id != REVIEWER_ID or reviewer_provider != REVIEWER_PROVIDER
+                or type(reviewer_provider) is not str or reviewer_provider.count(":") != 1
+                or not all(reviewer_provider.split(":")) or reviewer_id != REVIEWER_ID
                 or type(timeout) not in (int, float) or timeout < 75):
             raise ValueError("invalid reviewer service configuration")
         self.socket_path, self.key_id = socket_path, key_id
-        self.reviewer_id, self.reviewer_provider = reviewer_id, reviewer_provider
+        self.reviewer_id, self.reviewer_provider = REVIEWER_ID, reviewer_provider
         self.timeout = float(timeout)
 
     def __call__(self, task_id, proposal, *, state, approval_packet, approval_packet_digest, content):
@@ -96,7 +95,8 @@ class ReviewerServiceClient:
         current_key = signed.ReviewerPublicKey(current_key.key_id, current_key.reviewer_id,
                                                current_key.reviewer_provider, current_key.public_key,
                                                current_key.enabled, current_key.revoked)
-        if current_key.key_id != self.key_id or current_key.reviewer_id != self.reviewer_id or current_key.reviewer_provider != self.reviewer_provider:
+        if (current_key.key_id != self.key_id or current_key.reviewer_id != self.reviewer_id
+                or current_key.reviewer_provider != self.reviewer_provider):
             raise ValueError("reviewer identity does not match configured identity")
         policy = self._store.timing_policy
         policy = signed.AuthorizationTimingPolicy(policy.max_review_age_seconds,

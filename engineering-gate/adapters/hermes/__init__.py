@@ -36,6 +36,38 @@ def _approval_packet(state, profile_id):
     return canonical_approval_packet(state, profile_id)
 
 
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def _build_reviewer_client(ctx, profile_home):
+    """Build only from active plugin identity plus transport-only sidecar."""
+    try:
+        reviewer_provider = ctx.get_config("reviewer_provider")
+        if type(reviewer_provider) is not str or reviewer_provider.count(":") != 1:
+            return None
+        provider, model = reviewer_provider.split(":")
+        if not provider or not model or reviewer_provider != reviewer_provider.strip():
+            return None
+        if any(ord(char) < 32 or ord(char) == 127 for char in reviewer_provider):
+            return None
+        path = Path(profile_home) / "engineering-gate-reviewer-service.json"
+        config = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object)
+        if type(config) is not dict or set(config) != {"socket_path", "key_id", "timeout_seconds"}:
+            return None
+        from .reviewer_service import ReviewerServiceClient
+        return ReviewerServiceClient(config["socket_path"], key_id=config["key_id"],
+                                      reviewer_provider=reviewer_provider,
+                                      timeout=config["timeout_seconds"])
+    except Exception:
+        return None
+
+
 def register(ctx) -> None:
     """Register the approval tool and a per-context, fail-closed write readiness hook."""
     set_write_ready, make_readiness_binding = register_hooks(ctx)
@@ -98,22 +130,13 @@ def register(ctx) -> None:
         from .approval_sidecar import ApprovalSidecar
         execution_adapter = GateExecutionAdapter(profile_home=profile_home, profile_id=profile_id,
             state_store_provider=store_for_active_profile, approval_sidecar=ApprovalSidecar(profile_home))
-        # The socket client is enabled only by an explicit nonsecret profile config.
-        try:
-            config_path = profile_home / "engineering-gate-reviewer-service.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            if type(config) is dict and set(config) == {"socket_path", "key_id", "timeout_seconds"}:
-                from .reviewer_service import ReviewerServiceClient
-                client = ReviewerServiceClient(config["socket_path"], key_id=config["key_id"],
-                                               timeout=config["timeout_seconds"])
-                def review(task_id, proposal, **binding):
-                    return client.bind_store(store_for_active_profile(profile_id))(
-                        task_id, proposal, **binding)
-                review._reviewer_service_v1 = True
-                execution_adapter._reviewer_verdict_provider = review
-        except Exception:
-            # Invalid/missing config deliberately preserves the absent-provider block.
-            pass
+        client = _build_reviewer_client(ctx, profile_home)
+        if client is not None:
+            def review(task_id, proposal, **binding):
+                return client.bind_store(store_for_active_profile(profile_id))(
+                    task_id, proposal, **binding)
+            review._reviewer_service_v1 = True
+            execution_adapter._reviewer_verdict_provider = review
 
         async def gate_approve_plan(args, **kwargs):
             if type(args) is not dict or set(args) != {"task_id"}:

@@ -7,5 +7,12 @@ python_dependencies:
   - "cryptography>=46,<51"
   - "python-telegram-bot>=22.6,<23"
 requires_hermes: ">=0.21.4,<0.21.5"
+config_schema:
+  reviewer_provider:
+    type: str
+    required: false
+    description: >
+      Exact provider:model identity bound to the fixed Gate reviewer
+      engineering-gate-reviewer-v1; configured in the active profile settings.
 hooks:
   - pre_tool_call

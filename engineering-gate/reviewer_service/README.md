@@ -1,19 +1,77 @@
 # Reviewer Service v1 (operator-run, separate process)
 
-This package is independent of Gate core and the Hermes adapter. It accepts one framed JSON request per Unix stream connection (`!I` byte length followed by UTF-8 JSON; maximum 65,536 bytes), validates the complete approval packet and WRITE proposal, invokes the fixed Responses API model, then signs only its own v1 Gate verdict payload. Refusals, malformed model output, transport errors, and major/blocker findings fail closed. Caller verdict/signature/reviewer fields are never accepted.
+This process validates the complete approval packet and WRITE proposal, obtains one independent review, and signs only its own v1 verdict. Reviewer provider configuration is trusted operator input loaded at startup; review requests cannot choose providers, models, endpoints, credentials, or quotas. Configuration, transport, refusal, malformed output, or binding failures fail closed. There is no retry or fallback.
 
-## Local-only tests
+## Operator profile
 
-From repository root: `PYTHONPATH=engineering-gate pytest -q tests/reviewer_service`. Pytest uses its default temporary directory; pass `--basetemp=<temporary-directory>` if you need to choose one. Tests inject a synthetic Responses transport or monkeypatch the HTTP opener; they make no public network request. Production transport is hard-pinned to `https://api.openai.com/v1/responses`; endpoint overrides are not accepted. The exact requested model is `gpt-6.1-sol`, and non-completed, refused, ambiguous, or differently identified model responses fail closed.
+Create a UTF-8 JSON file owned by the service account and mode 0600. Example values and paths are deliberately fake:
 
-## Operator key lifecycle
+```json
+{
+  "provider": "ExampleCompatible",
+  "model": "example-model-exact-v3",
+  "adapter": "responses",
+  "endpoint": "https://review.example.invalid/v1/responses",
+  "api_key_file": "/secure/fake/example-api-key",
+  "timeout_seconds": 45,
+  "max_output_tokens": 1024,
+  "input_price_per_million_usd": 0.80,
+  "output_price_per_million_usd": 3.20,
+  "daily_budget_usd": 2.50,
+  "max_calls_per_day": 6,
+  "privacy": {"store": false, "tools": false}
+}
+```
 
-Run `PYTHONPATH=engineering-gate python -m reviewer_service.key_cli keygen /secure/path/reviewer.key`. The private key is created exclusively with mode 0600; stdout contains public-key metadata only. To export a public key from an existing private key: `PYTHONPATH=engineering-gate python -m reviewer_service.key_cli public-key /secure/path/reviewer.key /secure/path/reviewer.pub`. It validates the private file as a regular, non-symlink, effective-UID-owned 0600 file and creates the raw 32-byte public file exclusively; the private key is never printed. Send that file to the separate operator registry using `register --database ... KEY_ID REVIEWER_ID PROVIDER PUBLIC_KEY_FILE`. `list` exposes metadata/fingerprints; `revoke` requires a reason. These operator operations are not exposed over the service socket.
+`api_key_file` may be the empty string only for HTTP/HTTPS loopback endpoints; no Authorization header is sent then. Remote endpoints require a key file and HTTPS. The exact Gate identity belongs in the active Hermes profile's `config.yaml`, under plugin settings:
 
-## Service process
+```yaml
+plugins:
+  entries:
+    engineering-gate:
+      settings:
+        reviewer_provider: "ExampleCompatible:example-model-exact-v3"
+```
 
-Production requires provisioned service/client OS identities and a shared socket group. Example: `PYTHONPATH=engineering-gate python -m reviewer_service.service --socket /secure/run/reviewer.sock --ledger /secure/state/reviewer-ledger.sqlite --private-key /secure/path/reviewer.key --api-key-file /secure/path/openai-api-key --key-id KEY_ID --client-uid GATE_UID --socket-gid GATE_GROUP_GID --socket-mode 0660`. The authorized Gate UID is checked on each connection using Linux `SO_PEERCRED`; group and mode restrict filesystem connection access. Missing peer-credential support fails closed. Reads have a 5-second timeout; payloads are bounded to 65,536 bytes. Use a private parent directory and provision the service account, Gate account, and group outside this package; this code does not create accounts, groups, or activate a service. API key file must be regular, current-user-owned, and inaccessible to group/world; no credential is read from the environment.
+This is the sole source of Gate's expected provider:model identity. It must exactly match the service's configured provider and model and the registered public key for fixed reviewer ID `engineering-gate-reviewer-v1`. The service sidecar at `<profile_home>/engineering-gate-reviewer-service.json` is transport-only and accepts exactly these three fields:
 
-The structured audit logger emits only request ID, exact model, decision/outcome, request/proposal/packet SHA-256 digests, and usage/cost. It never logs prompts, raw task/packet/content, keys, or provider exception details. The ledger stores only request ID/digests, UTC day, reservation, outcome, and usage/cost—not raw requests.
+```json
+{
+  "socket_path": "/secure/run/reviewer.sock",
+  "key_id": "EXAMPLE_KEY",
+  "timeout_seconds": 75
+}
+```
 
-Limits: one attempt per request ID, at most 8 requests/day and $1.25/day reserved worst-case. The limits are configurable with `--max-reviews-per-day` (default 8) and `--daily-budget-usd` (default 1.25); nonpositive or non-finite values fail startup. Each attempt reserves from the exact serialized outbound request size using a conservative 4-token/byte input estimate at $2 per million, plus the full 2,048-token output cap at $10 per million. Framing is capped at 65,536 bytes, outbound serialization at `12 * 65,536 + 8,192` bytes, and input usage is validated against four times that outbound-byte cap. The cost ledger atomically rejects any request whose reservation exceeds the daily budget; therefore actual maximum admissions per day vary with prompt size (and are no more than 8). Reservations are not refunded on ambiguous timeouts or failed attempts. Provider timeout is 60 seconds, output cap 2,048 tokens; automatic retries are disabled. The Gate Unix-socket client defaults to a 75-second timeout and rejects configured values below 75 seconds, allowing a 15-second margin over the service HTTP timeout; an invalid profile timeout leaves the reviewer provider unavailable (fail-closed). Do not install or activate the service as a side effect of development.
+Unknown or duplicate fields—including an injected `reviewer_provider`—fail closed. Missing or malformed active plugin identity also disables the reviewer client. Review requests cannot override the identity, and the fixed reviewer ID is `engineering-gate-reviewer-v1`.
+
+Endpoints reject userinfo, query strings and fragments. Remote endpoints must use HTTPS; HTTP is accepted only for localhost/IP loopback. Redirects and ambient proxies are disabled. Only the configured endpoint is used, never request-controlled data. Operator must assess data-egress/privacy obligations and provider rate limits; daily call/budget limits here are local controls, not provider-side rate limiting.
+
+The key file must be a regular file owned by the service UID, mode 0600 or more restrictive, and contain only the credential (no newline). Credentials are never logged. Logs exclude prompts, review content and provider exception details.
+
+## Key registration and identity
+
+Generate/signing-key handling is described by `reviewer_service.key_cli`. Derive the exact provider identity from the trusted profile (this prints only the identity, not credentials):
+
+```sh
+PYTHONPATH=engineering-gate python -c 'import sys; from reviewer_service.provider_config import load_profile; print(load_profile(sys.argv[1]).provider_identity)' /secure/provider-profile.json
+```
+
+The derived value must exactly match the active Hermes profile's `plugins.entries.engineering-gate.settings.reviewer_provider` value and the registry entry identity for reviewer ID `engineering-gate-reviewer-v1`. Do not append a hash or normalize either provider or model. Gate matches the identity against the public-key registry entry and signed verdict. Key material stays in restrictive files.
+
+## Service
+
+Example invocation:
+
+```sh
+PYTHONPATH=engineering-gate python -m reviewer_service.service \
+  --socket /secure/run/reviewer.sock --ledger /secure/state/reviewer-ledger.sqlite \
+  --private-key /secure/fake/reviewer-private.key --profile /secure/fake/provider-profile.json \
+  --key-id EXAMPLE_KEY --client-uid 1200 --socket-gid 1201 --socket-mode 0660
+```
+
+The service authenticates Linux Unix-socket peers with `SO_PEERCRED`; provisioning accounts, groups, service installation, key registration and live activation are operator responsibilities and are not performed by this change. One request ID permits one attempt; ambiguous failures retain their reservation. The ledger reserves from serialized request size using configured upper-bound prices and computes actual usage cost from those same prices. Tests inject fake transports; no live activation is implied.
+
+## Local offline tests
+
+From repository root: `PYTHONPATH=engineering-gate PYTHONDONTWRITEBYTECODE=1 pytest -q tests/reviewer_service`. Tests use fake transports and do not make network calls.

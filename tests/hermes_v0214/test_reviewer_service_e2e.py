@@ -37,12 +37,14 @@ try:
     svc=r'''
 import json,os,sys
 from pathlib import Path
+from types import SimpleNamespace
 from reviewer_service.service import serve,decide_and_sign,Ledger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 sock,key,ledger=sys.argv[1:]
 raw=Path(key).read_bytes()
 priv=Ed25519PrivateKey.from_private_bytes(raw)
+profile=SimpleNamespace(provider="openai",model="gpt-6.1-sol",provider_identity="openai:gpt-6.1-sol",max_output_tokens=2048)
 def synthetic(body):
     Path(ledger+'.body').write_text(json.dumps(body,sort_keys=True))
     # Local deterministic stand-in: only approve when exact bound write content is present.
@@ -55,12 +57,12 @@ def synthetic(body):
     except Exception as exc:
         Path(ledger+'.modelerr').write_text(repr(exc))
         raise
-ledger_obj=Ledger(ledger)
+ledger_obj=Ledger(ledger,max_reviews_per_day=8,daily_budget_usd=1.25,input_price_per_million_usd=2.0,output_price_per_million_usd=10.0,max_output_tokens=2048)
 def handle(req):
     try:
         Path(ledger+'.request').write_text(json.dumps(req,sort_keys=True))
         assert 'verdict' not in req
-        return decide_and_sign(req,transport=synthetic,private_key=raw,key_id='e2e-key',ledger=ledger_obj)
+        return decide_and_sign(req,transport=synthetic,private_key=raw,key_id='e2e-key',ledger=ledger_obj,profile=profile)
     except Exception as exc:
         Path(ledger+'.err').write_text(repr(exc))
         raise
@@ -78,7 +80,7 @@ serve(sock,handle,authorized_uid=os.getuid(),socket_gid=os.getgid(),socket_mode=
     import importlib
     plugin_name=h.manager._plugins['engineering-gate'].module.__name__
     ReviewerServiceClient=importlib.import_module(plugin_name+'.adapters.hermes.reviewer_service').ReviewerServiceClient
-    client=ReviewerServiceClient(str(sock),key_id='e2e-key').bind_store(h.fixture.store)
+    client=ReviewerServiceClient(str(sock),key_id='e2e-key',reviewer_provider='openai:gpt-6.1-sol').bind_store(h.fixture.store)
     client._reviewer_service_v1=True
     h.set_provider(client)
     out=h.dispatch(); result=json.loads(out)
