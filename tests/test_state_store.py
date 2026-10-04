@@ -235,6 +235,89 @@ class StateStoreTests(unittest.TestCase):
         self.assertIs(loaded.state, TaskState.INSPECT)
         self.assertEqual(loaded.task.requester, RequesterIdentity("user-1"))
 
+    def test_caller_built_mutation_authorization_is_rejected_without_state_change(self):
+        import sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.workflow import TransitionError
+        from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
+            ExecutionPermit, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation,
+            OperationKind, Plan, PlanRevision, PlanReview, ReviewVerdict)
+        from engineering_gate_core.workflow import (canonical_mutation_proposal_digest, canonical_plan_digest,
+            mutation_argument_digest, capture_workspace_identity)
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update output")
+        root = str(Path(self.temp.name).resolve())
+        plan = Plan("inspect project", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                    workspace_root=root, workspace_identity=capture_workspace_identity(root))
+        digest = canonical_plan_digest(plan)
+        current = replace(self.record, state=TaskState.IMPLEMENTING, revision=PlanRevision(1), plan=plan,
+            plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+            approval_request=ApprovalRequest(self.record.task_id, 1, digest, "r"),
+            approval=ApprovalReceipt("r", self.record.task_id, 1, digest, self.record.task.requester, True),
+            permit=ExecutionPermit(self.record.task_id, 1, digest, MutationScope((op,))))
+        store = StateStore(self.path)
+        store.create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(current), self.record.task_id))
+        proposal = MutationProposal("p", self.record.task_id, 1, digest, op,
+                                    mutation_argument_digest("hello"), "reviewed write")
+        store.record_mutation_proposal(self.record.task_id, proposal)
+        before = store.load(self.record.task_id)
+        auth = MutationAuthorization("a", self.record.task_id, 1, digest,
+            canonical_mutation_proposal_digest(proposal), "provider", "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
+        with self.assertRaises(TransitionError):
+            store.record_mutation_authorization(self.record.task_id, auth, now="2026-10-01T10:30:00Z")
+        self.assertEqual(store.load(self.record.task_id), before)
+
+    def test_mutation_persistence_rejects_wrong_task_key_without_write(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        from engineering_gate_core.models import MutationProposal, NormalizedOperation, OperationKind
+        from engineering_gate_core.workflow import mutation_argument_digest
+        store = StateStore(self.path)
+        store.create(self.record)
+        invalid = MutationProposal("p", "other", 1, "0" * 64,
+                                   NormalizedOperation(OperationKind.WRITE, "a", "write"),
+                                   mutation_argument_digest("x"), "write")
+        before = store.load("task-1")
+        with self.assertRaises(StateStoreError):
+            store.record_mutation_proposal("other", invalid)
+        self.assertEqual(store.load("task-1"), before)
+
+    def test_invalid_or_expired_authorization_rolls_back_without_changing_record(self):
+        from dataclasses import replace
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError, _record_json
+        from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
+            ExecutionPermit, MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation,
+            OperationKind, Plan, PlanRevision, PlanReview, ReviewVerdict)
+        from engineering_gate_core.workflow import (canonical_mutation_proposal_digest, canonical_plan_digest,
+            capture_workspace_identity, mutation_argument_digest, record_mutation_proposal, TransitionError)
+        op = NormalizedOperation(OperationKind.WRITE, "output.txt", "update")
+        root = str(Path(self.temp.name).resolve())
+        plan = Plan("inspect project", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+            workspace_root=root, workspace_identity=capture_workspace_identity(root))
+        digest = canonical_plan_digest(plan)
+        current = replace(self.record, state=TaskState.IMPLEMENTING, revision=PlanRevision(1), plan=plan,
+            plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+            approval_request=ApprovalRequest(self.record.task_id, 1, digest, "r"),
+            approval=ApprovalReceipt("r", self.record.task_id, 1, digest, self.record.task.requester, True),
+            permit=ExecutionPermit(self.record.task_id, 1, digest, MutationScope((op,))))
+        proposal = MutationProposal("p", self.record.task_id, 1, digest, op, mutation_argument_digest("x"), "write")
+        current = record_mutation_proposal(current, proposal)
+        valid = MutationAuthorization("a", self.record.task_id, 1, digest,
+            canonical_mutation_proposal_digest(proposal), "provider", "2026-10-01T10:00:00Z", "2026-10-01T11:00:00Z")
+        store = StateStore(self.path)
+        store.create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (_record_json(current), self.record.task_id))
+        before = store.load(self.record.task_id)
+        for auth, now in ((valid, "2026-10-01T11:00:00Z"),
+                          (replace(valid, proposal_digest="0" * 64), "2026-10-01T10:30:00Z")):
+            with self.subTest(auth=auth), self.assertRaises(TransitionError):
+                store.record_mutation_authorization(self.record.task_id, auth, now=now)
+            self.assertEqual(store.load(self.record.task_id), before)
+
     def test_ill_typed_record_fails_closed(self):
         import json
         import sqlite3
@@ -447,6 +530,469 @@ class StateStoreTests(unittest.TestCase):
         with sqlite3.connect(self.path) as db:
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"metadata", "task_state"}.issubset(tables))
+
+    def test_execution_audit_transaction_is_persisted_and_append_only(self):
+        from dataclasses import replace
+        from datetime import datetime, timezone
+        from engineering_gate_core.models import (AcceptanceCriterion, ApprovalReceipt, ApprovalRequest,
+            ExecutionAuditRecord, ExecutionOutcome, ExecutionPermit, ExecutionTransactionResult,
+            MutationAuthorization, MutationProposal, MutationScope, NormalizedOperation, OperationKind,
+            Plan, PlanReview, PlanRevision, ReviewVerdict)
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        from engineering_gate_core.workflow import (canonical_mutation_proposal_digest, canonical_plan_digest,
+            capture_workspace_identity, mutation_argument_digest, record_mutation_proposal)
+        import sqlite3
+        store = StateStore(self.path)
+        store.create(self.record)
+        op = __import__("engineering_gate_core.models", fromlist=["NormalizedOperation"]).NormalizedOperation(OperationKind.WRITE, "output.txt")
+        root = str(Path(self.temp.name).resolve())
+        plan = Plan("inspect project", (op,), (AcceptanceCriterion("c", "works", "test"),), ("test",),
+                    workspace_root=root, workspace_identity=capture_workspace_identity(root))
+        digest = canonical_plan_digest(plan)
+        current = replace(self.record, state=TaskState.IMPLEMENTING, revision=PlanRevision(1), plan=plan,
+            plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+            approval_request=ApprovalRequest(self.record.task_id, 1, digest, "r"),
+            approval=ApprovalReceipt("r", self.record.task_id, 1, digest, self.record.task.requester, True),
+            permit=ExecutionPermit(self.record.task_id, 1, digest, MutationScope((op,))))
+        proposal = MutationProposal("p", self.record.task_id, 1, digest, op, mutation_argument_digest("hello"), "write")
+        current = record_mutation_proposal(current, proposal)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        stamp = now.isoformat().replace("+00:00", "Z")
+        authorization = MutationAuthorization("a", self.record.task_id, 1, digest,
+            canonical_mutation_proposal_digest(proposal), "provider", stamp,
+            (now.replace(year=now.year + 1)).isoformat().replace("+00:00", "Z"))
+        current = replace(current, mutation_authorization=authorization)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (__import__("engineering_gate_core.state_store", fromlist=["_record_json"])._record_json(current), self.record.task_id))
+            db.execute("INSERT INTO reviewer_keys VALUES(?,?,?,?,?,?,?)", ("key-a", "reviewer", "provider", b"k" * 32, 1, 0, stamp))
+            db.execute("INSERT INTO signed_verdicts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "review-a", "4" * 64, self.record.task_id, "key-a", b"payload", b"signature", "approve",
+                "reviewer", "provider", "implementer", 1, digest, canonical_mutation_proposal_digest(proposal), stamp, stamp))
+            lease_values = ("a", "review-a", self.record.task_id, 1, digest, canonical_mutation_proposal_digest(proposal),
+                "reviewer", "provider", "implementer", "key-a", stamp, stamp, "2099-01-01T00:00:00Z", "RESERVED", "reservation-a", "4" * 64)
+            db.execute("INSERT INTO mutation_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lease_values)
+        ws = plan.workspace_identity
+        audit = ExecutionAuditRecord("audit-1", self.record.task_id, 1, digest, authorization.proposal_digest,
+            "a", "1" * 64, OperationKind.WRITE, "output.txt", proposal.argument_digest, ws,
+            stamp, stamp, ExecutionOutcome.SUCCEEDED, "2" * 64)
+        result = ExecutionTransactionResult(audit, False)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DELETE FROM mutation_leases WHERE authorization_id='a'")
+        with self.assertRaises(StateStoreError):
+            store.with_current_state_transaction(self.record.task_id, lambda _: result)
+        with sqlite3.connect(self.path) as db:
+            db.execute("INSERT INTO mutation_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lease_values)
+        store.with_current_state_transaction(self.record.task_id, lambda _: result)
+        self.assertEqual(store.list_execution_audits(self.record.task_id), (audit,))
+
+        # A persisted audit cannot claim a proposal operation unless the current
+        # one-shot Gate permit still scopes that exact operation and revision.
+        wrong_permit = replace(current.permit, scope=MutationScope(()))
+        invalid_current = replace(current, permit=wrong_permit)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (
+                __import__("engineering_gate_core.state_store", fromlist=["_record_json"])._record_json(invalid_current),
+                self.record.task_id))
+        with self.assertRaises(StateStoreError):
+            store.with_current_state_transaction(self.record.task_id, lambda _: ExecutionTransactionResult(
+                replace(audit, audit_id="bad-permit-scope"), False))
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=? WHERE task_id=?", (
+                __import__("engineering_gate_core.state_store", fromlist=["_record_json"])._record_json(current),
+                self.record.task_id))
+        # Envelope fields must match the current state, proposal, and permit.
+        for changed in (
+            replace(audit, proposal_digest="9" * 64, audit_id="bad-proposal"),
+            replace(audit, authorization_id="different", audit_id="bad-auth"),
+            replace(audit, task_id="other-task", audit_id="bad-task"),
+            replace(audit, revision=2, audit_id="bad-revision"),
+            replace(audit, plan_digest="8" * 64, audit_id="bad-plan"),
+            replace(audit, target="other.txt", audit_id="bad-target"),
+            replace(audit, argument_digest="7" * 64, audit_id="bad-argument"),
+        ):
+            with self.subTest(audit=changed), self.assertRaises(StateStoreError):
+                store.with_current_state_transaction(self.record.task_id,
+                    lambda _, changed=changed: ExecutionTransactionResult(changed, False))
+        with sqlite3.connect(self.path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE execution_audit SET target='changed' WHERE audit_id='audit-1'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("DELETE FROM execution_audit WHERE audit_id='audit-1'")
+        duplicate = replace(audit, audit_id="audit-2", permit_hash="1" * 64)
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.with_current_state_transaction(self.record.task_id,
+                lambda _: ExecutionTransactionResult(duplicate, False))
+
+    def test_v1_payload_is_canonicalized_without_changing_typed_state(self):
+        import json
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore
+
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            (payload,) = db.execute("SELECT payload FROM task_state").fetchone()
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(json.loads(payload), indent=2),))
+            db.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        reopened = StateStore(self.path)
+        self.assertEqual(reopened.load("task-1"), self.record)
+        with sqlite3.connect(self.path) as db:
+            (payload,) = db.execute("SELECT payload FROM task_state").fetchone()
+            self.assertEqual(payload, __import__("engineering_gate_core.state_store", fromlist=["_record_json"])._record_json(self.record))
+
+    def test_v1_rejects_legacy_approval_without_plan_atomically(self):
+        import sqlite3, json
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, StateStoreError, _record_json
+        from engineering_gate_core.models import ApprovalReceipt, ApprovalRequest, PlanDigest, PlanRevision
+        store = StateStore(self.path)
+        store.create(self.record)
+        approved_without_plan = replace(self.record, approval_request=ApprovalRequest(
+            self.record.task_id, PlanRevision(1), PlanDigest("0" * 64), "request"),
+            approval=ApprovalReceipt("request", self.record.task_id, PlanRevision(1),
+                                     PlanDigest("0" * 64), self.record.task.requester, True))
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (_record_json(approved_without_plan),))
+            db.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        with self.assertRaises(StateStoreError):
+            StateStore(self.path).load("task-1")
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "1")
+            self.assertEqual(db.execute("SELECT payload FROM task_state").fetchone()[0], _record_json(approved_without_plan))
+
+    def test_v1_migration_rejects_key_mismatch_atomically(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload='{}' WHERE task_id='task-1'")
+            db.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        with self.assertRaises(StateStoreError):
+            StateStore(self.path).load("task-1")
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "1")
+            self.assertEqual(db.execute("SELECT payload FROM task_state WHERE task_id='task-1'").fetchone()[0], "{}")
+
+    def test_audit_schema_rejects_incompatible_existing_table(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE execution_audit")
+            db.execute("CREATE TABLE execution_audit (audit_id TEXT)")
+        with self.assertRaises(StateStoreError):
+            StateStore(self.path).load("task-1")
+
+    def test_v1_database_migrates_atomically_to_v2(self):
+        import sqlite3
+        import json
+        from engineering_gate_core.state_store import StateStore
+        store = StateStore(self.path)
+        store.create(self.record)
+        with sqlite3.connect(self.path) as db:
+            (payload,) = db.execute("SELECT payload FROM task_state WHERE task_id='task-1'").fetchone()
+            raw = json.loads(payload)
+            for key in ("mutation_authorization", "mutation_proposal"):
+                raw.pop(key, None)
+            db.execute("UPDATE task_state SET payload=? WHERE task_id='task-1'", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        reopened = StateStore(self.path)
+        self.assertEqual(reopened.load("task-1"), self.record)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "5")
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_audit'").fetchone())
+
+    def test_v4_migrates_to_v5_authorization_schema(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore
+        store = StateStore(self.path)
+        store.create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE metadata SET value='4' WHERE key='schema_version'")
+            for table in ("mutation_leases", "signed_verdicts", "reviewer_keys", "authorization_audit"):
+                db.execute(f"DROP TABLE {table}")
+        reopened = StateStore(self.path)
+        self.assertEqual(reopened.load("task-1"), self.record)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0], "5")
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({"reviewer_keys", "signed_verdicts", "mutation_leases", "authorization_audit"}.issubset(tables))
+
+    def test_authorization_clock_high_watermark_blocks_backwards_open(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE metadata SET value='2999-01-01T00:00:00Z' WHERE key='authorization_clock_high_watermark'")
+        with self.assertRaisesRegex(StateStoreError, "clock moved backwards"):
+            StateStore(self.path)
+
+    def test_v3_migration_sanitizes_legacy_nested_result_and_is_idempotent(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import (AcceptanceCriterion, NormalizedOperation, OperationKind,
+            Plan, PlanRevision, TaskState)
+        from engineering_gate_core.workflow import canonical_plan_digest
+        store = StateStore(self.path); store.create(self.record)
+        plan = Plan("old", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        completed = replace(self.record, state=TaskState.COMPLETED, revision=PlanRevision(7), plan=plan,
+                            plan_digest=canonical_plan_digest(plan))
+        raw = json.loads(_record_json(completed))
+        raw["verification"] = {"$tuple": [{"$type": "VerificationResult", "criterion_id": "c",
+            "evidence": {"$tuple": [{"$type": "Evidence", "source": "old", "detail": "legacy pass", "passed": True}]},
+            "passed": True}]}
+        raw["plan"].pop("verification_commands")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='3' WHERE key='schema_version'")
+        migrated = StateStore(self.path).load("task-1")
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(migrated.state, TaskState.PLAN)
+        self.assertEqual(int(migrated.revision), 8)
+        self.assertEqual(migrated.verification, ())
+        self.assertIsNone(migrated.result_review)
+        self.assertIsNone(migrated.handoff)
+        self.assertEqual(migrated, reopened)
+
+    def test_v2_migration_invalidates_legacy_verification_and_reopens_completion(self):
+        import sqlite3
+        import json
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import (AcceptanceCriterion, NormalizedOperation, OperationKind,
+            Plan, PlanRevision, TaskState)
+        from engineering_gate_core.workflow import canonical_plan_digest
+        store = StateStore(self.path); store.create(self.record)
+        plan = Plan("old", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "works", "test"),), ("test",))
+        completed = replace(self.record, state=TaskState.COMPLETED, revision=PlanRevision(1), plan=plan,
+            plan_digest=canonical_plan_digest(plan))
+        with sqlite3.connect(self.path) as db:
+            raw = json.loads(_record_json(completed))
+            raw["plan"].pop("verification_commands")
+            raw["verification"] = {"$tuple": [{"$type": "VerificationResult", "criterion_id": "c",
+                "evidence": {"$tuple": [{"$type": "Evidence", "source": "old", "detail": "legacy pass", "passed": True}]},
+                "passed": True}]}
+            raw["result_review"] = {"$type": "ResultReview", "verdict": {"$enum": "ReviewVerdict", "value": "pass"}, "notes": "legacy"}
+            raw["handoff"] = {"$type": "Handoff", "summary": "done", "evidence": {"$tuple": []}}
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(reopened.state, TaskState.PLAN)
+        self.assertEqual(reopened.revision, 2)
+        self.assertEqual(reopened.verification, ())
+        self.assertIsNone(reopened.result_review)
+        self.assertIsNone(reopened.handoff)
+
+    def test_v2_migration_revokes_active_records_when_legacy_plan_digest_changes(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import Plan, AcceptanceCriterion, NormalizedOperation, OperationKind, PlanRevision, PlanDigest
+        from engineering_gate_core.workflow import canonical_plan_digest
+
+        store = StateStore(self.path)
+        store.create(self.record)
+        plan = Plan("inspect", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "ok", "test"),), ("test",))
+        active = replace(self.record, state=TaskState.APPROVED, revision=PlanRevision(4), plan=plan,
+                         plan_digest=PlanDigest("a" * 64))
+        raw = json.loads(_record_json(active))
+        raw["plan"].pop("verification_commands")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(reopened.state, TaskState.PLAN)
+        self.assertEqual(reopened.revision, 5)
+        self.assertEqual(reopened.plan_digest, canonical_plan_digest(reopened.plan))
+        self.assertIsNone(reopened.approval)
+        self.assertIsNone(reopened.approval_request)
+        self.assertIsNone(reopened.permit)
+        self.assertIsNone(reopened.mutation_proposal)
+        self.assertIsNone(reopened.mutation_authorization)
+        self.assertIsNone(reopened.plan_review)
+        self.assertIsNone(reopened.result_review)
+        self.assertIsNone(reopened.blast_radius)
+        self.assertEqual(reopened.verification, ())
+
+    def test_v2_plan_with_stale_digest_is_reopened_consistently(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import Plan, AcceptanceCriterion, NormalizedOperation, OperationKind, PlanDigest
+        from engineering_gate_core.workflow import canonical_plan_digest
+
+        store = StateStore(self.path)
+        store.create(self.record)
+        plan = Plan("inspect", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "ok", "test"),), ("test",))
+        legacy = replace(self.record, state=TaskState.PLAN, plan=plan, plan_digest=PlanDigest("b" * 64))
+        raw = json.loads(_record_json(legacy))
+        raw["plan"].pop("verification_commands")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
+
+        reopened = StateStore(self.path).load("task-1")
+        self.assertEqual(reopened.state, TaskState.PLAN)
+        self.assertEqual(reopened.revision, int(legacy.revision) + 1)
+        self.assertEqual(reopened.plan_digest, canonical_plan_digest(plan))
+        self.assertEqual(reopened.verification, ())
+
+    def test_v1_tagged_nested_plan_missing_identity_is_invalidated_only(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import Plan, AcceptanceCriterion, NormalizedOperation, OperationKind
+        from engineering_gate_core.workflow import canonical_plan_digest
+        store = StateStore(self.path)
+        store.create(self.record)
+        plan = Plan("inspect", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "ok", "test"),), ("test",), workspace_root="/tmp")
+        advanced = replace(self.record, state=TaskState.PLAN, plan=plan, plan_digest=canonical_plan_digest(plan),
+                           analysis=__import__("engineering_gate_core.models", fromlist=["Evidence"]).Evidence("e", "summary"))
+        raw = json.loads(_record_json(advanced))
+        raw["plan"].pop("workspace_identity")
+        raw.pop("mutation_authorization")
+        raw.pop("mutation_proposal")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+            db.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        loaded = StateStore(self.path).load("task-1")
+        self.assertEqual(loaded.analysis, advanced.analysis)
+        self.assertEqual(loaded.plan, plan)
+        self.assertIsNone(loaded.plan.workspace_identity)
+        self.assertEqual(int(loaded.revision), int(advanced.revision) + 1)
+        self.assertEqual(loaded.state, TaskState.PLAN)
+        self.assertIsNone(loaded.approval)
+        self.assertIsNone(loaded.approval_request)
+        self.assertIsNone(loaded.plan_review)
+        self.assertEqual(loaded.plan_digest, canonical_plan_digest(plan))
+
+    def test_v1_tagged_plan_missing_only_mutation_fields_preserves_approval(self):
+        import json, sqlite3
+        from dataclasses import replace
+        from engineering_gate_core.state_store import StateStore, _record_json
+        from engineering_gate_core.models import (Plan, AcceptanceCriterion, NormalizedOperation, OperationKind,
+            PlanDigest, PlanRevision, ApprovalRequest, ApprovalReceipt, PlanReview, ReviewVerdict)
+        from engineering_gate_core.workflow import canonical_plan_digest
+        store = StateStore(self.path); store.create(self.record)
+        plan = Plan("inspect", (NormalizedOperation(OperationKind.READ, "a"),),
+                    (AcceptanceCriterion("c", "ok", "test"),), ("test",), workspace_root="/tmp",
+                    workspace_identity=__import__("engineering_gate_core.workflow", fromlist=["capture_workspace_identity"]).capture_workspace_identity("/tmp"))
+        digest = canonical_plan_digest(plan)
+        approved = replace(self.record, state=TaskState.APPROVED, revision=PlanRevision(1), plan=plan,
+            plan_digest=digest, plan_review=PlanReview(ReviewVerdict.APPROVED),
+            approval_request=ApprovalRequest(self.record.task_id, 1, digest, "req"),
+            approval=ApprovalReceipt("req", self.record.task_id, 1, digest, self.record.task.requester, True))
+        raw = json.loads(_record_json(approved)); raw.pop("mutation_authorization"); raw.pop("mutation_proposal")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),)); db.execute("UPDATE metadata SET value='1'")
+        loaded = StateStore(self.path).load("task-1")
+        self.assertEqual(loaded.approval, approved.approval)
+        self.assertEqual(loaded.state, TaskState.APPROVED)
+
+    def test_v1_migration_rejects_untagged_and_unknown_fields(self):
+        import json, sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        store = StateStore(self.path); store.create(self.record)
+        with sqlite3.connect(self.path) as db:
+            raw=json.loads(db.execute("SELECT payload FROM task_state").fetchone()[0]); raw.pop("$type")
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),)); db.execute("UPDATE metadata SET value='1'")
+        with self.assertRaises(StateStoreError): StateStore(self.path).load("task-1")
+
+    def test_audit_schema_rejects_noop_named_trigger(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TRIGGER execution_audit_no_update")
+            db.execute("CREATE TRIGGER execution_audit_no_update BEFORE UPDATE ON execution_audit BEGIN SELECT 1; END")
+        with self.assertRaises(StateStoreError): StateStore(self.path).load("task-1")
+
+    def test_audit_schema_rejects_conditionally_weakened_same_name_trigger(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TRIGGER execution_audit_no_update")
+            db.execute("CREATE TRIGGER execution_audit_no_update BEFORE UPDATE ON execution_audit WHEN NEW.target != OLD.target BEGIN SELECT RAISE(ABORT,'append-only'); END")
+        with self.assertRaises(StateStoreError): StateStore(self.path).load("task-1")
+
+    def test_audit_schema_rejects_wrong_column_same_name_index(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP INDEX execution_audit_task_idx")
+            db.execute("CREATE INDEX execution_audit_task_idx ON execution_audit(revision, task_id)")
+        with self.assertRaises(StateStoreError): StateStore(self.path).load("task-1")
+
+    def test_audit_schema_rejects_extra_index(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db: db.execute("CREATE INDEX unexpected ON execution_audit(target)")
+        with self.assertRaises(StateStoreError): StateStore(self.path).load("task-1")
+
+    def test_audit_model_rejects_naive_timestamps(self):
+        from engineering_gate_core.models import (ExecutionAuditRecord, ExecutionOutcome,
+            OperationKind, WorkspaceIdentity)
+        valid = dict(audit_id="audit-1", task_id="task-1", revision=0,
+            plan_digest="0" * 64, proposal_digest="1" * 64,
+            authorization_id="auth-1", permit_hash="2" * 64,
+            operation_kind=OperationKind.WRITE, target="output.txt",
+            argument_digest="3" * 64, workspace_identity=WorkspaceIdentity("/workspace", 1, 2),
+            started_at="2026-10-01T10:00:00", completed_at="2026-10-01T10:01:00Z",
+            outcome=ExecutionOutcome.OUTCOME_UNKNOWN)
+        with self.assertRaises(ValueError):
+            ExecutionAuditRecord(**valid)
+
+    def test_execution_transaction_envelope_rejects_non_boolean_detachment(self):
+        from engineering_gate_core.models import ExecutionTransactionResult
+        with self.assertRaises(ValueError):
+            ExecutionTransactionResult(None, 1)
+
+    def test_v2_decoder_rejects_missing_mutation_fields(self):
+        import json
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            raw = json.loads(db.execute("SELECT payload FROM task_state").fetchone()[0])
+            raw.pop("mutation_proposal")
+            db.execute("UPDATE task_state SET payload=?", (json.dumps(raw),))
+        with self.assertRaises(StateStoreError):
+            StateStore(self.path).load("task-1")
+
+    def test_audit_schema_rejects_weakened_checks(self):
+        import sqlite3
+        from engineering_gate_core.state_store import StateStore, StateStoreError
+        StateStore(self.path).create(self.record)
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE execution_audit")
+            db.execute("CREATE TABLE execution_audit (audit_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES task_state(task_id), revision INTEGER NOT NULL, plan_digest TEXT NOT NULL, proposal_digest TEXT NOT NULL, authorization_id TEXT NOT NULL, permit_hash TEXT NOT NULL UNIQUE, operation_kind TEXT NOT NULL CHECK(operation_kind='write'), target TEXT NOT NULL, argument_digest TEXT NOT NULL, workspace_identity TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('succeeded','outcome_unknown')), resulting_artifact_digest TEXT, path_detached INTEGER NOT NULL CHECK(path_detached IN (0,1)), error_class TEXT, CHECK(1))")
+        with self.assertRaises(StateStoreError):
+            StateStore(self.path).load("task-1")
+
+    def test_execution_audit_requires_canonical_timestamps_and_outcome(self):
+        from engineering_gate_core.models import ExecutionAuditRecord, ExecutionOutcome, OperationKind, WorkspaceIdentity
+        fields = dict(audit_id="audit-1", task_id="task-1", revision=0,
+            plan_digest="0" * 64, proposal_digest="1" * 64, authorization_id="auth-1",
+            permit_hash="2" * 64, operation_kind=OperationKind.WRITE, target="output.txt",
+            argument_digest="3" * 64, workspace_identity=WorkspaceIdentity("/workspace", 1, 2),
+            started_at="2026-10-01T10:00:00Z", completed_at="2026-10-01T10:01:00Z",
+            outcome=ExecutionOutcome.OUTCOME_UNKNOWN)
+        for changed in (dict(started_at="2026-10-01T10:00:00+00:00"),
+                        dict(completed_at="2026-10-01T10:01:00.000Z"),
+                        dict(outcome="outcome_unknown")):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                ExecutionAuditRecord(**(fields | changed))
 
 
 if __name__ == "__main__":
